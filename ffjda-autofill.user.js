@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.0.0
+// @version      1.0.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -362,11 +362,20 @@
     }
     const nomA    = norm(adherent.nom);
     const prenomA = norm(adherent.prenom);
-    const candidates = Array.from(document.querySelectorAll('a[href]'))
-      .filter(a => a.href.includes('/fiche-licence/') || a.classList.contains('bluelink'));
-    const match = candidates.find(a => {
-      const t = norm(a.textContent);
-      return t.includes(nomA) && t.includes(prenomA);
+    // Le nom et le lien "Fiche licence" sont deux <a> distincts dans la même
+    // ligne du tableau de résultats : le lien de fiche n'a jamais le nom
+    // dans son propre texte. On le repère puis on vérifie que sa ligne
+    // parente (2-3 niveaux au-dessus) contient bien le nom recherché.
+    const ficheLinks = Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => a.href.includes('/fiche-licence/') || /fiche\s*licence/i.test(a.textContent));
+    const match = ficheLinks.find(a => {
+      let node = a;
+      for (let i = 0; i < 3 && node; i++) {
+        const t = norm(node.textContent);
+        if (t.includes(nomA) && t.includes(prenomA)) return true;
+        node = node.parentElement;
+      }
+      return false;
     });
     if (match) return { found: true, href: match.href };
     const noResult = Array.from(document.querySelectorAll('p, div, span'))
