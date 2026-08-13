@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.1.4
+// @version      1.2.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -24,7 +24,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.1.4';
+  const SCRIPT_VERSION = '1.2.0';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -150,33 +150,51 @@
   // l'extension (extension/background/background.js), sans passer par
   // chrome.scripting puisqu'on tourne déjà dans le contexte de la page.
   // ================================================================
-  function fillEtape1(adherent) {
-    function si(name, val) {
+  // Écrit dans un champ via le setter natif du prototype : les formulaires
+  // FFJDA sont pilotés par un framework qui suit sa propre copie de la valeur
+  // et ignore une écriture directe `el.value = …` (il soumettrait un champ
+  // vide). Le setter natif déclenche son tracking, comme une frappe clavier.
+  function setNativeValue(el, val) {
+    const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
+                : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
+                : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    try { el.focus(); } catch (e) {}
+    if (desc && desc.set) desc.set.call(el, val); else el.value = val;
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+  }
+
+  async function fillEtape1(adherent) {
+    function set(name, val) {
       const el = document.querySelector(`[name="${name}"]`);
       if (!el || val == null) return false;
-      el.value = val;
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    function ss(name, val) {
-      const el = document.querySelector(`[name="${name}"]`);
-      if (!el || val == null) return false;
-      el.value = val;
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNativeValue(el, val);
       return true;
     }
     let f = 0;
-    if (si('nom',       adherent.nom))                       f++;
-    if (si('prenom',    adherent.prenom))                    f++;
-    if (ss('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
-    if (si('naissance', adherent.date_naissance || ''))      f++;
-    setTimeout(() => {
-      const btn = Array.from(document.querySelectorAll('button[type="submit"]'))
-        .find(b => b.textContent.trim().toLowerCase().includes('valider'));
-      if (btn) btn.click();
-    }, 400);
-    return { step: 1, success: f > 0, filled: f };
+    if (set('nom',       adherent.nom))                       f++;
+    if (set('prenom',    adherent.prenom))                    f++;
+    if (set('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
+    if (set('naissance', adherent.date_naissance || ''))      f++;
+
+    // Laisse le framework enregistrer la saisie avant de valider.
+    await new Promise(r => setTimeout(r, 400));
+
+    // Relit les champs : s'ils sont vides, la validation échouerait sans
+    // jamais naviguer — autant le signaler tout de suite.
+    const read = n => { const el = document.querySelector(`[name="${n}"]`); return el ? el.value : null; };
+    const state = { nom: read('nom'), prenom: read('prenom'), naissance: read('naissance') };
+
+    const btn = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
+      .find(b => ((b.textContent || b.value || '').trim().toLowerCase()).includes('valider'));
+    if (btn) {
+      ['mousedown', 'mouseup', 'click'].forEach(type =>
+        btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }))
+      );
+    }
+    return { step: 1, success: f > 0 && !!state.nom && !!state.prenom, filled: f, submitted: !!btn, ...state };
   }
 
   function clickCreerLicence() {
@@ -189,19 +207,18 @@
   function fillEtape2(adherent) {
     function norm(s) { return (s || '').toUpperCase().replace(/-/g, ' '); }
     function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+    // Même contrainte qu'à l'étape 1 : passer par le setter natif, sinon le
+    // framework FFJDA ignore la saisie.
     function si(name, val) {
       const el = document.querySelector(`[name="${name}"]`);
       if (!el || val == null) return false;
-      el.value = val;
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNativeValue(el, val);
       return true;
     }
     function ss(name, val) {
       const el = document.querySelector(`[name="${name}"]`);
       if (!el || val == null) return false;
-      el.value = val;
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNativeValue(el, val);
       return true;
     }
     function sr(name, val) {
@@ -471,6 +488,23 @@
     Api.markSaisie(adherent.item_id).catch(() => {});
   }
 
+  // Délai de garde après un clic censé faire naviguer la page (valider,
+  // créer une licence, renouveler, ouvrir une fiche). Si la navigation ne
+  // vient pas, l'adhérent est marqué en échec et la file avance, au lieu de
+  // rester bloquée indéfiniment sur un message d'attente figé.
+  // Si la navigation a bien lieu, ce contexte de script est détruit et la
+  // boucle disparaît avec lui — elle n'a donc pas besoin de la détecter.
+  async function failIfNoNavigation(flow, adherent, reason, timeoutMs = 12000) {
+    const from = location.href;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, 500));
+      if (location.href !== from) return;   // navigation en cours
+    }
+    await setStatus(`${adherent.nom} — ${reason}`, 'error');
+    await finishAdherent(flow, adherent, false, reason, 1500);
+  }
+
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
     flow.results.push({ nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null });
     await storeSet('flow', flow);
@@ -573,6 +607,7 @@
         // Clic (et non navigation) : c'est le geste humain, et il fonctionne
         // que le lien porte une vraie URL ou qu'il soit piloté en JS.
         res.el.click();
+        await failIfNoNavigation(flow, adherent, 'Clic sur le nom sans effet (fiche non ouverte)');
       } else if (res.noResult) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
         await finishAdherent(flow, adherent, false, 'Non trouvé (pas de licence active FFJDA)', 3000);
@@ -590,6 +625,7 @@
         const r = clickRenewButton();
         if (r && r.clicked) {
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — renouvellement en cours...`, 'info');
+          await failIfNoNavigation(flow, adherent, 'Clic "Renouveler" sans effet');
         } else {
           const available = (r && r.available && r.available.join(' | ')) || '';
           await setStatus(`[${idx + 1}/${total}] Bouton renouveler introuvable. Disponible : ${available}`, 'error');
@@ -633,13 +669,17 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1...`, 'info');
       await new Promise(r => setTimeout(r, 800));
       try {
-        const r = fillEtape1(adherent);
+        const r = await fillEtape1(adherent);
         if (!r || !r.success) {
-          await setStatus(`[${idx + 1}/${total}] Étape 1 : aucun champ rempli.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Étape 1 : aucun champ rempli');
+          const why = (r && (!r.nom || !r.prenom))
+            ? `Étape 1 : champs non pris en compte (nom="${(r && r.nom) || ''}", prénom="${(r && r.prenom) || ''}")`
+            : 'Étape 1 : aucun champ rempli';
+          await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
+          await finishAdherent(flow, adherent, false, why);
           return;
         }
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1 ✅ → Validation...`, 'info');
+        await failIfNoNavigation(flow, adherent, 'Étape 1 validée sans effet (formulaire refusé ?)');
       } catch (e) {
         await setStatus('Erreur étape 1 : ' + e.message, 'error');
         await finishAdherent(flow, adherent, false, 'Erreur étape 1 : ' + e.message);
@@ -657,6 +697,7 @@
           await finishAdherent(flow, adherent, false, 'Bouton "créer une licence" introuvable');
           return;
         }
+        await failIfNoNavigation(flow, adherent, 'Clic "Créer une licence" sans effet');
       } catch (e) {
         await setStatus('Erreur intermédiaire : ' + e.message, 'error');
         await finishAdherent(flow, adherent, false, 'Erreur intermédiaire : ' + e.message);
