@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.1.1
+// @version      1.1.2
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -24,7 +24,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.1.1';
+  const SCRIPT_VERSION = '1.1.2';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -398,7 +398,15 @@
       }
       return false;
     });
-    if (match) return { found: true, href: match.href };
+    if (match) {
+      // Tous les liens "Fiche licence" ne sont pas navigables : certains sont
+      // pilotés en JS (href="#", "javascript:…"). Naviguer vers un tel href
+      // donne une PAGE BLANCHE — dans ce cas il faut cliquer le lien.
+      const href = match.getAttribute('href') || '';
+      const navigable = match.href.includes('/fiche-licence/')
+        && !/^\s*(#|javascript:)/i.test(href);
+      return { found: true, href: match.href, navigable, el: match };
+    }
     const noResult = Array.from(document.querySelectorAll('p, div, span'))
       .some(el => el.textContent.toLowerCase().includes('aucun licencié'));
     return { found: false, noResult };
@@ -426,7 +434,7 @@
       await new Promise(r => setTimeout(r, 500));
       try {
         const r = findLicenceLink(adherent);
-        if (r && r.found)    return { found: true,  href: r.href };
+        if (r && r.found)    return r;
         if (r && r.noResult) return { found: false, noResult: true };
       } catch (e) {}
     }
@@ -536,7 +544,15 @@
       const res = await pollForResults(adherent);
       if (res.found) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ouverture fiche...`, 'info');
-        location.href = res.href;
+        // Naviguer seulement si le href est une vraie URL de fiche ; sinon
+        // cliquer, car le lien est piloté en JS (naviguer vers "#" ou
+        // "javascript:…" donnerait une page blanche).
+        if (res.navigable) location.href = res.href;
+        else if (res.el)   res.el.click();
+        else {
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — lien fiche inutilisable.`, 'error');
+          await finishAdherent(flow, adherent, false, 'Lien fiche licence inutilisable', 3000);
+        }
       } else if (res.noResult) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
         await finishAdherent(flow, adherent, false, 'Non trouvé (pas de licence active FFJDA)', 3000);
