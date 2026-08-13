@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.0.3
+// @version      1.1.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -24,7 +24,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.0.3';
+  const SCRIPT_VERSION = '1.1.0';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -111,8 +111,16 @@
   const Api = {
     getAdherents: (campaign) => apiCall(`/adherents${campaign ? `?campaign=${encodeURIComponent(campaign)}` : ''}`),
     getCampaigns: () => apiCall('/campaigns'),
+    triggerSync: (formSlug) => apiCall('/sync', { method: 'POST', body: formSlug ? { form_slug: formSlug } : undefined }),
     markSaisie: (itemId) => apiCall('/mark-saisie', { method: 'POST', body: { item_id: itemId, value: true } }),
   };
+
+  // "adhesion-2026-2027-sport" → "Saison 2026/2027"
+  function campaignLabel(slug) {
+    return (slug || '')
+      .replace(/^adhesion-(\d{4})-(\d{4})-sport$/, 'Saison $1/$2')
+      .replace(/^stage-judo-printemps$/, 'Stage Printemps');
+  }
 
   // ================================================================
   // Détection d'étape FFJDA (identique à l'extension Chrome)
@@ -652,6 +660,9 @@
   let adherents = [];
   let selected = new Set();
   let currentFilter = 'judo';
+  let campaigns = [];
+  let currentCampaign = null;   // slug de la saison affichée
+  let unsaisieOnly = false;
 
   function isIaido(a) {
     const tier = (a.tier || '').toLowerCase();
@@ -699,7 +710,8 @@
       .jcc-adh-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 12px; }
       .jcc-adh-item:last-child { border-bottom: none; }
       .jcc-adh-item.saisie { opacity: 0.5; }
-      .jcc-counter { font-size: 11px; color: #a8c8e8; margin-bottom: 6px; text-align: right; }
+      .jcc-counter { font-size: 11px; color: #a8c8e8; margin-bottom: 6px; text-align: right; line-height: 1.5; }
+      .jcc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a8c8e8; margin-bottom: 8px; }
       #jcc-ffjda-progress { height: 5px; background: #0f2233; border-radius: 3px; margin-bottom: 8px; overflow: hidden; }
       #jcc-ffjda-progress-fill { height: 100%; background: #1a6fa8; width: 0%; transition: width .3s; }
     `;
@@ -769,7 +781,7 @@
       if (currentFilter === 'iaido') return isIaido(a);
       if (currentFilter === 'judo')  return !isIaido(a);
       return true;
-    });
+    }).filter(({ a }) => !unsaisieOnly || !a.saisie_ffjda);
   }
 
   function renderList(listEl, filterText) {
@@ -778,15 +790,21 @@
       !ft || `${a.nom} ${a.prenom}`.toLowerCase().includes(ft)
     );
     if (filtered.length === 0) {
-      listEl.innerHTML = '<div style="padding:10px;text-align:center;color:#8aa;font-size:11px">Aucun adhérent.</div>';
+      listEl.innerHTML = '<div style="padding:10px;text-align:center;color:#8aa;font-size:11px">Aucun adhérent (essayez 🔄 pour synchroniser cette saison).</div>';
       return;
     }
-    listEl.innerHTML = filtered.map(({ a, idx }) => `
+    listEl.innerHTML = filtered.map(({ a, idx }) => {
+      // 🔑 = licence FFJDA connue → renouvellement ; ✨ = pas de licence → création.
+      // C'est exactement la règle qui décidera du mode au lancement.
+      const modeBadge = hasLicenceFFJDA(a)
+        ? '<span title="Renouvellement">🔑</span>'
+        : '<span title="Nouvelle licence">✨</span>';
+      return `
       <label class="jcc-adh-item${a.saisie_ffjda ? ' saisie' : ''}">
         <input type="checkbox" data-idx="${idx}" ${selected.has(idx) ? 'checked' : ''}>
-        <span>${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}</span>
-      </label>
-    `).join('');
+        <span>${modeBadge} ${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}</span>
+      </label>`;
+    }).join('');
     listEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       cb.addEventListener('change', (e) => {
         const idx = parseInt(e.target.dataset.idx, 10);
@@ -794,11 +812,20 @@
         updateCounter();
       });
     });
+    updateCounter();
   }
 
   function updateCounter() {
+    const visible = getFiltered();
+    const nRenew = visible.filter(({ a }) => hasLicenceFFJDA(a)).length;
+    const nNew   = visible.length - nRenew;
+    const nTodo  = visible.filter(({ a }) => !a.saisie_ffjda).length;
     const counterEl = document.getElementById('jcc-counter');
-    if (counterEl) counterEl.textContent = `${selected.size} sélectionné(s)`;
+    if (counterEl) {
+      counterEl.innerHTML =
+        `${visible.length} affiché(s) · 🔑 ${nRenew} renouv. · ✨ ${nNew} nouv.<br>` +
+        `${nTodo} à saisir · <b>${selected.size} sélectionné(s)</b>`;
+    }
     const launchBtn = document.getElementById('jcc-launch-btn');
     if (launchBtn) launchBtn.disabled = selected.size === 0;
   }
@@ -814,37 +841,68 @@
         </select>
       </div>
       <div class="jcc-f-row">
+        <select id="jcc-campaign"><option value="">Saison : chargement…</option></select>
+      </div>
+      <div class="jcc-f-row">
         <input type="text" id="jcc-search" placeholder="Filtrer par nom...">
       </div>
+      <label class="jcc-check"><input type="checkbox" id="jcc-unsaisie"> Non saisis seulement</label>
       <div class="jcc-btn-row" style="margin-bottom:8px">
-        <button class="jcc-btn secondary" id="jcc-btn-reload">🔄 Charger</button>
+        <button class="jcc-btn secondary" id="jcc-btn-reload" title="Recharger depuis l'API">↺</button>
+        <button class="jcc-btn secondary" id="jcc-btn-sync" title="Synchroniser cette saison depuis HelloAsso">🔄 Sync</button>
         <button class="jcc-btn secondary" id="jcc-btn-all">Tout</button>
         <button class="jcc-btn secondary" id="jcc-btn-none">Aucun</button>
       </div>
-      <div class="jcc-counter" id="jcc-counter">0 sélectionné(s)</div>
+      <div class="jcc-counter" id="jcc-counter">—</div>
       <div id="jcc-ffjda-list"></div>
       <button class="jcc-btn" id="jcc-launch-btn" disabled>▶ Lancer la saisie</button>
     `;
     const listEl = content.querySelector('#jcc-ffjda-list');
     const searchEl = content.querySelector('#jcc-search');
+    const campaignEl = content.querySelector('#jcc-campaign');
+    const unsaisieEl = content.querySelector('#jcc-unsaisie');
+    unsaisieEl.checked = unsaisieOnly;
     renderList(listEl, '');
 
     content.querySelector('#jcc-discipline').addEventListener('change', (e) => {
       currentFilter = e.target.value;
+      selected.clear();
       renderList(listEl, searchEl.value);
+    });
+    unsaisieEl.addEventListener('change', (e) => {
+      unsaisieOnly = e.target.checked;
+      selected.clear();
+      renderList(listEl, searchEl.value);
+    });
+    campaignEl.addEventListener('change', async (e) => {
+      // Changer de saison REMPLACE la liste : on veut voir qui est inscrit
+      // pour CETTE saison-là, pas un mélange de toutes les saisons.
+      currentCampaign = e.target.value || null;
+      await storeSet('campaign', currentCampaign);
+      selected.clear();
+      await loadAdherents(content);
     });
     searchEl.addEventListener('input', () => renderList(listEl, searchEl.value));
     content.querySelector('#jcc-btn-all').addEventListener('click', () => {
       getFiltered().forEach(({ idx }) => selected.add(idx));
       renderList(listEl, searchEl.value);
-      updateCounter();
     });
     content.querySelector('#jcc-btn-none').addEventListener('click', () => {
       selected.clear();
       renderList(listEl, searchEl.value);
-      updateCounter();
     });
     content.querySelector('#jcc-btn-reload').addEventListener('click', () => loadAdherents(content));
+    content.querySelector('#jcc-btn-sync').addEventListener('click', async () => {
+      const label = campaignLabel(currentCampaign) || 'la saison courante';
+      await setStatus(`🔄 Synchronisation HelloAsso — ${label}...`, 'info');
+      const res = await Api.triggerSync(currentCampaign || undefined);
+      if (!res.ok) {
+        await setStatus(`❌ Sync échouée : ${res.data.detail || res.status}`, 'error');
+        return;
+      }
+      await setStatus(`✅ ${res.data.paid ?? '?'} adhérent(s) payé(s) synchronisé(s).`, 'success');
+      await loadAdherents(content);
+    });
     content.querySelector('#jcc-launch-btn').addEventListener('click', async () => {
       if (selected.size === 0) return;
       const queue = [...selected].sort((a, b) => a - b)
@@ -853,19 +911,51 @@
       await startQueue(queue);
     });
 
-    if (adherents.length === 0) loadAdherents(content);
+    loadCampaigns(content).then(() => {
+      if (adherents.length === 0) loadAdherents(content);
+    });
+  }
+
+  // Remplit le sélecteur de saison. Par défaut on sélectionne la campagne
+  // marquée "current" côté API (ou celle mémorisée), pour que le panneau
+  // ouvre directement sur la saison en cours de traitement.
+  async function loadCampaigns(content) {
+    const res = await Api.getCampaigns();
+    if (!res.ok || !res.data.campaigns) return;
+    campaigns = res.data.campaigns.filter(
+      c => (c.type || 'Membership') === 'Membership' &&
+           (c.slug.includes('adhesion') || c.slug === 'stage-judo-printemps')
+    );
+    const saved = await storeGet('campaign', null);
+    currentCampaign = saved || res.data.current || (campaigns[0] && campaigns[0].slug) || null;
+
+    const el = content.querySelector('#jcc-campaign');
+    if (!el) return;
+    el.innerHTML = campaigns.map(c =>
+      `<option value="${c.slug}"${c.slug === currentCampaign ? ' selected' : ''}>${campaignLabel(c.slug)}</option>`
+    ).join('');
   }
 
   async function loadAdherents(content) {
-    await setStatus('🔄 Chargement des adhérents...', 'info');
-    const res = await Api.getAdherents();
+    const label = campaignLabel(currentCampaign);
+    await setStatus(`↺ Chargement ${label || 'des adhérents'}...`, 'info');
+    const res = await Api.getAdherents(currentCampaign || undefined);
     if (!res.ok) {
       if (res.missingToken) { renderTokenForm(content); return; }
       await setStatus(`❌ Erreur chargement : ${res.data.detail || res.status}`, 'error');
       return;
     }
     adherents = res.data.adherents || [];
-    await setStatus(`✅ ${adherents.length} adhérent(s) chargé(s).`, 'success');
+    selected.clear();
+    if (adherents.length === 0) {
+      await setStatus(`⚠️ Aucun adhérent pour ${label || 'cette saison'} — lancez 🔄 Sync pour la récupérer depuis HelloAsso.`, 'error');
+    } else {
+      const nRenew = adherents.filter(hasLicenceFFJDA).length;
+      await setStatus(
+        `✅ ${label} : ${adherents.length} adhérent(s) — 🔑 ${nRenew} à renouveler, ✨ ${adherents.length - nRenew} à créer.`,
+        'success'
+      );
+    }
     const listEl = document.getElementById('jcc-ffjda-list');
     const searchEl = document.getElementById('jcc-search');
     if (listEl) renderList(listEl, searchEl ? searchEl.value : '');
