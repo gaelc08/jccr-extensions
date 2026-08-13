@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.0.2
+// @version      1.0.3
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -20,6 +20,11 @@
 
 (function () {
   'use strict';
+
+  // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
+  // quelle version tourne réellement (l'app Userscripts peut servir une
+  // copie en cache). À garder synchro avec @version en tête de fichier.
+  const SCRIPT_VERSION = '1.0.3';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -708,7 +713,7 @@
     panel.innerHTML = `
       <div id="jcc-ffjda-header">
         <span class="title">🥋 JCCR → FFJDA</span>
-        <span style="font-size:11px;opacity:.7">▾</span>
+        <span style="font-size:11px;opacity:.7">v${SCRIPT_VERSION} ▾</span>
       </div>
       <div id="jcc-ffjda-body">
         <div id="jcc-ffjda-status"></div>
