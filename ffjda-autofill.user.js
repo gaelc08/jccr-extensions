@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.0.1
+// @version      1.0.2
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -116,7 +116,15 @@
     if (!url) return null;
     if (/\/fiche-licence\/select\//.test(url))                              return 'renew_fiche';
     if (url.includes('/achat-licence/renouvellement-licence-club/etape_1')) return 'renew_form';
-    if (url.includes('/renouvellement-licencie-club'))                       return 'renew_search';
+    if (url.includes('/renouvellement-licencie-club')) {
+      // "RECHERCHER" NAVIGUE vers cette même URL avec les critères en query
+      // string (?nom=…&prenom=…#resultats_recherche) puis charge les résultats
+      // en asynchrone. Sans distinguer les deux états, on re-remplirait le
+      // formulaire en boucle au lieu d'attendre les résultats.
+      return (/[?&]nom=[^&#]/.test(url) || url.includes('resultats_recherche'))
+        ? 'renew_results'
+        : 'renew_search';
+    }
     if (url.includes('/achat-licence/creation-licence-club/etape_1'))       return 'etape2';
     if (url.includes('/saisir-licence/etape-2'))                            return 'intermediaire';
     if (url.includes('/saisir-licence'))                                     return 'etape1';
@@ -399,7 +407,7 @@
     };
   }
 
-  async function pollForResults(adherent, timeoutMs = 8000) {
+  async function pollForResults(adherent, timeoutMs = 15000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 500));
@@ -489,20 +497,27 @@
 
     // ---------------- RENOUVELLEMENT ----------------
 
-    if (step === 'renew_search') {
-      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — recherche...`, 'info');
-      await new Promise(r => setTimeout(r, 1000));
-      try {
-        const clicked = fillSearchForm(adherent);
-        if (!clicked) {
-          await setStatus(`[${idx + 1}/${total}] Bouton Rechercher introuvable.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Bouton Rechercher introuvable');
+    if (step === 'renew_search' || step === 'renew_results') {
+      // Deux états de la MÊME URL :
+      //  - renew_search  : formulaire vierge → remplir et soumettre. Le clic
+      //    NAVIGUE (query string + #resultats_recherche), ce qui détruit ce
+      //    contexte de script ; la page suivante repasse ici en renew_results.
+      //  - renew_results : résultats en cours de chargement → on attend le lien.
+      if (step === 'renew_search') {
+        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — recherche...`, 'info');
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const clicked = fillSearchForm(adherent);
+          if (!clicked) {
+            await setStatus(`[${idx + 1}/${total}] Bouton Rechercher introuvable.`, 'error');
+            await finishAdherent(flow, adherent, false, 'Bouton Rechercher introuvable');
+            return;
+          }
+        } catch (e) {
+          await setStatus('Erreur formulaire recherche : ' + e.message, 'error');
+          await finishAdherent(flow, adherent, false, 'Erreur formulaire recherche : ' + e.message);
           return;
         }
-      } catch (e) {
-        await setStatus('Erreur formulaire recherche : ' + e.message, 'error');
-        await finishAdherent(flow, adherent, false, 'Erreur formulaire recherche : ' + e.message);
-        return;
       }
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — attente des résultats...`, 'info');
       const res = await pollForResults(adherent);
