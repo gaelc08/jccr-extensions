@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.1.3
+// @version      1.1.4
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -24,7 +24,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.1.3';
+  const SCRIPT_VERSION = '1.1.4';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -359,20 +359,50 @@
     });
   }
 
-  function fillSearchForm(adherent) {
-    function setField(name, val) {
-      const el = document.querySelector(`[name="${name}"]`);
-      if (!el) return;
-      el.value = val;
+  // Retourne { clicked, nom, prenom, btn, reason } — les valeurs relues
+  // servent à diagnostiquer une saisie que le framework aurait ignorée.
+  async function fillSearchForm(adherent) {
+    // Affecter `el.value` ne suffit pas : les formulaires FFJDA sont pilotés
+    // par un framework qui suit sa propre copie de la valeur et ignore une
+    // écriture directe — il soumettrait alors un champ vide. Passer par le
+    // setter natif du prototype déclenche le tracking du framework, comme le
+    // ferait une vraie frappe clavier.
+    function setFieldValue(el, val) {
+      const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
+                  : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
+                  : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      try { el.focus(); } catch (e) {}
+      if (desc && desc.set) desc.set.call(el, val); else el.value = val;
       el.dispatchEvent(new Event('input',  { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur',   { bubbles: true }));
     }
-    setField('nom', adherent.nom);
-    setField('prenom', adherent.prenom);
-    const btn = Array.from(document.querySelectorAll('button'))
-      .find(b => b.textContent.trim().toUpperCase().includes('RECHERCHER'));
-    if (btn) { btn.click(); return true; }
-    return false;
+
+    const nomEl    = document.querySelector('[name="nom"]');
+    const prenomEl = document.querySelector('[name="prenom"]');
+    if (nomEl)    setFieldValue(nomEl,    adherent.nom);
+    if (prenomEl) setFieldValue(prenomEl, adherent.prenom);
+
+    // Laisse au framework le temps d'enregistrer la saisie avant de soumettre.
+    await new Promise(r => setTimeout(r, 350));
+
+    // Le bouton peut être un <button> ou un <input type="submit"> ; on ignore
+    // "AFFICHER TOUTES LES LICENCES" (qui ne contient pas "RECHERCHER").
+    const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+      .find(b => ((b.textContent || b.value || '').trim().toUpperCase()).includes('RECHERCHER'));
+    const state = {
+      nom:    nomEl    ? nomEl.value    : null,
+      prenom: prenomEl ? prenomEl.value : null,
+    };
+    if (!btn) return Object.assign({ clicked: false, reason: 'Bouton RECHERCHER introuvable' }, state);
+
+    // Séquence de clic complète : certains handlers écoutent mousedown/mouseup
+    // plutôt que click.
+    ['mousedown', 'mouseup', 'click'].forEach(type =>
+      btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }))
+    );
+    return Object.assign({ clicked: true, btn: (btn.textContent || btn.value || '').trim() }, state);
   }
 
   function findLicenceLink(adherent) {
@@ -514,10 +544,20 @@
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — recherche...`, 'info');
         await new Promise(r => setTimeout(r, 1000));
         try {
-          const clicked = fillSearchForm(adherent);
-          if (!clicked) {
-            await setStatus(`[${idx + 1}/${total}] Bouton Rechercher introuvable.`, 'error');
-            await finishAdherent(flow, adherent, false, 'Bouton Rechercher introuvable');
+          const r = await fillSearchForm(adherent);
+          if (!r || !r.clicked) {
+            const why = (r && r.reason) || 'Bouton RECHERCHER introuvable';
+            await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
+            await finishAdherent(flow, adherent, false, why);
+            return;
+          }
+          // Si le framework a ignoré la saisie, la recherche partirait à vide :
+          // on le détecte en relisant les champs plutôt que d'attendre un
+          // timeout de 15 s sur une page de résultats vide.
+          if (!r.nom || !r.prenom) {
+            const why = `Champs de recherche non pris en compte (nom="${r.nom || ''}", prénom="${r.prenom || ''}")`;
+            await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
+            await finishAdherent(flow, adherent, false, why);
             return;
           }
         } catch (e) {
