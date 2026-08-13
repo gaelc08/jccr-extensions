@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.1.2
+// @version      1.1.3
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -24,7 +24,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.1.2';
+  const SCRIPT_VERSION = '1.1.3';
 
   // ================================================================
   // Contexte page : jQuery de la page cible (peut être sandboxé selon
@@ -383,30 +383,16 @@
     }
     const nomA    = norm(adherent.nom);
     const prenomA = norm(adherent.prenom);
-    // Le nom et le lien "Fiche licence" sont deux <a> distincts dans la même
-    // ligne du tableau de résultats : le lien de fiche n'a jamais le nom
-    // dans son propre texte. On le repère puis on vérifie que sa ligne
-    // parente (2-3 niveaux au-dessus) contient bien le nom recherché.
-    const ficheLinks = Array.from(document.querySelectorAll('a[href]'))
-      .filter(a => a.href.includes('/fiche-licence/') || /fiche\s*licence/i.test(a.textContent));
-    const match = ficheLinks.find(a => {
-      let node = a;
-      for (let i = 0; i < 3 && node; i++) {
-        const t = norm(node.textContent);
-        if (t.includes(nomA) && t.includes(prenomA)) return true;
-        node = node.parentElement;
-      }
-      return false;
+    // C'est le lien PORTANT LE NOM ("FICHET CELINE") qui ouvre la fiche de
+    // renouvellement. Le lien "Fiche licence" de la même ligne mène à la
+    // consultation — une impasse qui ne se rend pas (page blanche). On cible
+    // donc le nom, et on le CLIQUE (son href est souvent piloté en JS).
+    // Pas de filtre sur [href] : le lien peut n'en porter aucun.
+    const match = Array.from(document.querySelectorAll('a')).find(a => {
+      const t = norm(a.textContent);
+      return t.includes(nomA) && t.includes(prenomA);
     });
-    if (match) {
-      // Tous les liens "Fiche licence" ne sont pas navigables : certains sont
-      // pilotés en JS (href="#", "javascript:…"). Naviguer vers un tel href
-      // donne une PAGE BLANCHE — dans ce cas il faut cliquer le lien.
-      const href = match.getAttribute('href') || '';
-      const navigable = match.href.includes('/fiche-licence/')
-        && !/^\s*(#|javascript:)/i.test(href);
-      return { found: true, href: match.href, navigable, el: match };
-    }
+    if (match) return { found: true, el: match };
     const noResult = Array.from(document.querySelectorAll('p, div, span'))
       .some(el => el.textContent.toLowerCase().includes('aucun licencié'));
     return { found: false, noResult };
@@ -544,15 +530,9 @@
       const res = await pollForResults(adherent);
       if (res.found) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ouverture fiche...`, 'info');
-        // Naviguer seulement si le href est une vraie URL de fiche ; sinon
-        // cliquer, car le lien est piloté en JS (naviguer vers "#" ou
-        // "javascript:…" donnerait une page blanche).
-        if (res.navigable) location.href = res.href;
-        else if (res.el)   res.el.click();
-        else {
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — lien fiche inutilisable.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Lien fiche licence inutilisable', 3000);
-        }
+        // Clic (et non navigation) : c'est le geste humain, et il fonctionne
+        // que le lien porte une vraie URL ou qu'il soit piloté en JS.
+        res.el.click();
       } else if (res.noResult) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
         await finishAdherent(flow, adherent, false, 'Non trouvé (pas de licence active FFJDA)', 3000);
