@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.2.0
+// @version      1.3.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -18,20 +18,433 @@
 // @connect      sync.judo-cattenom.fr
 // ==/UserScript==
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GÉNÉRÉ — ne pas éditer ce fichier.
+// Assemblé par scripts/build-userscript.js depuis :
+//   • extension/lib/ffjda-flow.js          (partagé avec l'extension Chrome)
+//   • userscripts/ffjda-autofill.user.js   (panneau, file d'attente, API)
+// Toute correction se fait dans ces sources, puis rebuild.
+// ─────────────────────────────────────────────────────────────────────────────
+// ffjda-flow.js — SOURCE UNIQUE de l'automatisation du portail FFJDA.
+//
+// Consommé par les deux surfaces :
+//   • extension Chrome  — `importScripts('/lib/ffjda-flow.js')` dans le service
+//     worker, puis injection via chrome.scripting.executeScript({ func })
+//   • userscript mobile — concaténé dans ffjda-autofill.user.js au build
+//     (scripts/build-userscript.js), qui l'appelle directement : il s'exécute
+//     déjà dans le contexte de la page
+//
+// ── Pourquoi UNE seule grosse fonction `applyStep` ? ──────────────────────────
+// chrome.scripting.executeScript({ func }) SÉRIALISE la fonction (via
+// Function.prototype.toString) pour l'exécuter dans la page : elle ne peut donc
+// référencer AUCUNE variable de sa portée englobante. Découper en petites
+// fonctions obligerait à redéfinir les helpers (setNativeValue, norm…) dans
+// chacune — c'est exactement la duplication qui a fait diverger l'extension et
+// le userscript. Une fonction unique et auto-suffisante les partage en interne.
+//
+// `detectStep` reste à part : elle est pure et n'est jamais injectée (le service
+// worker l'appelle chez lui, le userscript aussi).
+
+(function (root) {
+  'use strict';
+
+  /**
+   * Étape du parcours FFJDA déduite de l'URL courante.
+   * Retourne null si la page n'appartient pas au parcours.
+   */
+  function detectStep(url) {
+    if (!url) return null;
+    // Renouvellement
+    if (/\/fiche-licence\/select\//.test(url))                              return 'renew_fiche';
+    if (url.includes('/achat-licence/renouvellement-licence-club/etape_1')) return 'renew_form';
+    if (url.includes('/renouvellement-licencie-club')) {
+      // "RECHERCHER" ne remplit pas la page en place : il NAVIGUE vers cette
+      // même URL avec les critères en query string (?nom=…&prenom=…) puis
+      // charge les résultats en asynchrone. Sans distinguer les deux états,
+      // on re-remplirait le formulaire en boucle au lieu d'attendre.
+      return (/[?&]nom=[^&#]/.test(url) || url.includes('resultats_recherche'))
+        ? 'renew_results'
+        : 'renew_search';
+    }
+    // Nouvelle licence
+    if (url.includes('/achat-licence/creation-licence-club/etape_1'))       return 'etape2';
+    if (url.includes('/saisir-licence/etape-2'))                            return 'intermediaire';
+    if (url.includes('/saisir-licence'))                                     return 'etape1';
+    if (url.includes('/prise-licence'))                                      return 'depart';
+    return null;
+  }
+
+  /**
+   * Exécute une action dans la page FFJDA. AUTO-SUFFISANTE : ne référence rien
+   * hors de son propre corps (contrainte de sérialisation, voir en-tête).
+   *
+   * @param {string} action  'search' | 'findLink' | 'clickLink' | 'clickRenew'
+   *                         | 'clickCreate' | 'etape1' | 'etape2'
+   * @param {object} adherent
+   */
+  async function applyStep(action, adherent) {
+    adherent = adherent || {};
+
+    // ── Helpers partagés par toutes les actions ──────────────────────────────
+
+    function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // MAJUSCULES, sans accents, espaces normalisés — pour comparer des noms.
+    function normName(s) {
+      return (s || '').toUpperCase()
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/[\s-]+/g, ' ').trim();
+    }
+    // minuscules sans accents — pour comparer des libellés.
+    function normText(s) {
+      return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+    }
+    // Comparaison des options select2 (tirets assimilés à des espaces).
+    function normOpt(s) { return (s || '').toUpperCase().replace(/-/g, ' '); }
+
+    // Affecter `el.value` ne suffit pas : les formulaires FFJDA sont pilotés
+    // par un framework qui suit sa propre copie de la valeur et ignore une
+    // écriture directe — il soumettrait alors un champ vide. Le setter natif
+    // du prototype déclenche son tracking, comme une vraie frappe clavier.
+    function setNativeValue(el, val) {
+      const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
+                  : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
+                  : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      try { el.focus(); } catch (e) {}
+      if (desc && desc.set) desc.set.call(el, val); else el.value = val;
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur',   { bubbles: true }));
+    }
+
+    // Séquence de clic complète : certains handlers FFJDA écoutent
+    // mousedown/mouseup plutôt que click.
+    function realClick(el) {
+      ['mousedown', 'mouseup', 'click'].forEach(type =>
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }))
+      );
+    }
+
+    function setByName(name, val) {
+      const el = document.querySelector(`[name="${name}"]`);
+      if (!el || val == null) return false;
+      setNativeValue(el, val);
+      return true;
+    }
+    function readByName(name) {
+      const el = document.querySelector(`[name="${name}"]`);
+      return el ? el.value : null;
+    }
+    // Radio : un vrai clic est nécessaire, le framework ignore 'change' seul.
+    function setRadio(name, val) {
+      const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
+      if (!el) return false;
+      if (!el.checked) el.click();
+      el.checked = true;
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    function setCheck(id, checked) {
+      const el = document.getElementById(id) || document.querySelector(`input[name="${id}"]`);
+      if (!el) return false;
+      el.checked = checked;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    // Sélectionne l'option d'un <select> dont le TEXTE contient `text`.
+    function selectByText(name, text) {
+      const sel = document.querySelector(`select[name="${name}"]`);
+      if (!sel) return false;
+      const nt = normText(text);
+      const opt = Array.from(sel.options).find(o => normText(o.textContent).includes(nt));
+      if (!opt) return false;
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+
+    // Le lien PORTANT LE NOM ("FICHET CELINE") ouvre la fiche de
+    // renouvellement. Le lien "Fiche licence" de la même ligne mène à la
+    // consultation — une impasse qui ne se rend pas (page blanche). Pas de
+    // filtre sur [href] : ce lien peut n'en porter aucun, son action étant en JS.
+    function findNameLink() {
+      const nomA    = normName(adherent.nom);
+      const prenomA = normName(adherent.prenom);
+      return Array.from(document.querySelectorAll('a')).find(a => {
+        const t = normName(a.textContent);
+        return t.includes(nomA) && t.includes(prenomA);
+      }) || null;
+    }
+
+    // jQuery de la PAGE. `unsafeWindow` n'existe que sous un gestionnaire de
+    // userscripts ; dans le monde MAIN de l'extension, `window` suffit.
+    function pageJQuery() {
+      const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      return w.jQuery;
+    }
+
+    // ── Actions simples ──────────────────────────────────────────────────────
+
+    if (action === 'findLink') {
+      if (findNameLink()) return { found: true };
+      const noResult = Array.from(document.querySelectorAll('p, div, span'))
+        .some(el => el.textContent.toLowerCase().includes('aucun licencié'));
+      return { found: false, noResult };
+    }
+
+    if (action === 'clickLink') {
+      const el = findNameLink();
+      if (!el) return false;
+      el.click();
+      return true;
+    }
+
+    if (action === 'clickRenew') {
+      const candidates = Array.from(document.querySelectorAll('a, button'));
+      const btn = candidates.find(el => {
+        const t = el.textContent.trim().toLowerCase();
+        return t.includes('renouveler') || t.includes('renouvellement');
+      });
+      if (btn) { btn.click(); return { clicked: true, text: btn.textContent.trim() }; }
+      // Renvoie les libellés présents, pour diagnostiquer un sélecteur obsolète.
+      return {
+        clicked: false,
+        available: candidates
+          .filter(el => el.textContent.trim().length > 1 && el.textContent.trim().length < 60)
+          .map(el => el.textContent.trim())
+          .slice(0, 10),
+      };
+    }
+
+    if (action === 'clickCreate') {
+      const btn = Array.from(document.querySelectorAll('a.big-btn'))
+        .find(a => a.textContent.trim().toLowerCase().includes('créer une licence'));
+      if (btn) { btn.click(); return true; }
+      return false;
+    }
+
+    // ── Recherche d'un licencié à renouveler ─────────────────────────────────
+
+    if (action === 'search') {
+      setByName('nom',    adherent.nom);
+      setByName('prenom', adherent.prenom);
+
+      // Laisse au framework le temps d'enregistrer la saisie avant de soumettre.
+      await wait(350);
+
+      // Le bouton peut être un <button> ou un <input type="submit"> ; on ignore
+      // "AFFICHER TOUTES LES LICENCES" (qui ne contient pas "RECHERCHER").
+      const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+        .find(b => ((b.textContent || b.value || '').trim().toUpperCase()).includes('RECHERCHER'));
+
+      // Champs relus : si le framework a ignoré la saisie, la recherche
+      // partirait à vide et l'appelant peut le signaler immédiatement plutôt
+      // que d'attendre un timeout sur une page de résultats vide.
+      const state = { nom: readByName('nom'), prenom: readByName('prenom') };
+      if (!btn) return Object.assign({ clicked: false, reason: 'Bouton RECHERCHER introuvable' }, state);
+
+      realClick(btn);
+      return Object.assign({ clicked: true, btn: (btn.textContent || btn.value || '').trim() }, state);
+    }
+
+    // ── Étape 1 nouvelle licence : identité ──────────────────────────────────
+
+    if (action === 'etape1') {
+      let f = 0;
+      if (setByName('nom',       adherent.nom))                       f++;
+      if (setByName('prenom',    adherent.prenom))                    f++;
+      if (setByName('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
+      if (setByName('naissance', adherent.date_naissance || ''))      f++;
+
+      await wait(400);
+
+      const state = {
+        nom: readByName('nom'), prenom: readByName('prenom'), naissance: readByName('naissance'),
+      };
+      const btn = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
+        .find(b => ((b.textContent || b.value || '').trim().toLowerCase()).includes('valider'));
+      if (btn) realClick(btn);
+
+      return Object.assign(
+        { step: 1, success: f > 0 && !!state.nom && !!state.prenom, filled: f, submitted: !!btn },
+        state
+      );
+    }
+
+    // ── Étape 2, commune aux nouvelles licences et aux renouvellements ───────
+
+    if (action === 'etape2') {
+      // Assurance IAC — TOUJOURS "Oui". Le mapping FFJDA est INVERSÉ :
+      // value="0" = « Oui » (souscrire), value="1" = « Non » (refus, qui OUVRE
+      // un modal Bootstrap). On coche donc value="0" et on désélectionne
+      // value="1" SANS JAMAIS le cliquer, pour ne pas déclencher ce modal.
+      // Ré-appliqué avant "Suivant" : remplir le CP/l'adresse (select2)
+      // déclenche un recalcul FFJDA qui remet la souscription sur "Non".
+      function ensureIAC() {
+        const oui = document.querySelector('input[name="souscription"][value="0"]');
+        const non = document.querySelector('input[name="souscription"][value="1"]');
+        if (non) non.checked = false;
+        let okRadio = false;
+        if (oui) {
+          if (!oui.checked) oui.click();   // clic réel : réveille le handler
+          oui.checked = true;              // puis verrouille l'état
+          const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
+          if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true })); // idempotent sur un radio
+          oui.checked = true;
+          oui.dispatchEvent(new Event('input',  { bubbles: true }));
+          oui.dispatchEvent(new Event('change', { bubbles: true }));
+          okRadio = oui.checked;
+        } else {
+          console.log('[JCCR] IAC: radio input[name="souscription"][value="0"] introuvable');
+        }
+        // Case "assurance" : pas de clic sur le label, il RE-BASCULERAIT la case.
+        let okCase = false;
+        const ass = document.querySelector('input[name="assurance"]');
+        if (ass) {
+          if (!ass.checked) ass.click();
+          ass.checked = true;
+          ass.dispatchEvent(new Event('input',  { bubbles: true }));
+          ass.dispatchEvent(new Event('change', { bubbles: true }));
+          okCase = ass.checked;
+        } else {
+          console.log('[JCCR] IAC: case input[name="assurance"] introuvable');
+        }
+        return okRadio || okCase;
+      }
+
+      function clickOpt(el) {
+        ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
+          el.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }))
+        );
+      }
+
+      // Champs adresse : select2 alimenté en AJAX, il faut ouvrir, taper, attendre.
+      function fillSelect2(selectName, searchText, targetText) {
+        return new Promise(resolve => {
+          const jq = pageJQuery();
+          if (!jq) { resolve(false); return; }
+          jq('.select2-container--open [name]').each(function () {
+            try { jq(this).select2('close'); } catch (e) {}
+          });
+          const $sel = jq(`[name="${selectName}"]`);
+          if (!$sel.length || !$sel.data('select2')) { resolve(false); return; }
+          setTimeout(() => {
+            $sel.select2('open');
+            setTimeout(() => {
+              const input = document.querySelector('.select2-container--open .select2-search__field');
+              if (!input) { $sel.select2('close'); resolve(false); return; }
+              input.focus(); input.value = searchText;
+              input.dispatchEvent(new Event('input',         { bubbles: true }));
+              input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+              setTimeout(() => {
+                const opts = document.querySelectorAll(
+                  '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
+                );
+                const nt = normOpt(targetText);
+                let match = Array.from(opts).find(o => normOpt(o.textContent).includes(nt));
+                if (!match && opts[0]) match = opts[0];
+                if (match) { clickOpt(match); setTimeout(() => resolve(true), 400); }
+                else { $sel.select2('close'); resolve(false); }
+              }, 1500);
+            }, 500);
+          }, 200);
+        });
+      }
+
+      // Garde ceinture/grade : on n'y touche JAMAIS, mais un autre champ
+      // (discipline, adresse…) peut la réinitialiser par effet de bord côté
+      // framework. On mémorise son état avant saisie pour le restaurer avant
+      // de valider l'étape.
+      function snapshotBelt() {
+        return Array.from(document.querySelectorAll('[name*="ceinture"], [name*="grade"]'))
+          .map(el => ({ el, value: el.value, checked: el.checked }));
+      }
+      function restoreBelt(snap) {
+        snap.forEach(({ el, value, checked }) => {
+          let changed = false;
+          if (el.type === 'checkbox' || el.type === 'radio') {
+            if (el.checked !== checked) { el.checked = checked; changed = true; }
+          } else if (el.value !== value) {
+            el.value = value; changed = true;
+          }
+          if (changed) el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      }
+
+      let f = 0;
+      const beltSnap = snapshotBelt();
+
+      if (adherent.telephone) setByName('portable', adherent.telephone) && f++;
+      if (adherent.email) {
+        setByName('mail',         adherent.email) && f++;
+        setByName('mail-confirm', adherent.email) && f++;
+      }
+      // Dojo (A ou B) — Dojo A par défaut
+      if (adherent.dojo && setByName('dojo-code', adherent.dojo)) f++;
+      if (setByName('pratiques_1', adherent.pratique || '1')) f++;
+      // Loisir/Compétition découle de la DISCIPLINE (règle président), pas de
+      // la donnée individuelle : judo ('1') et iaïdo ('13') → 'C' ;
+      // taïso ('3') et tout autre → 'L'.
+      const tpl = (adherent.pratique === '1' || adherent.pratique === '13') ? 'C' : 'L';
+      if (setRadio('type_pratique_1', tpl)) f++;
+      setRadio('handicap', '0');
+      // Certificat médical : découle aussi de la discipline, JAMAIS "En attente".
+      // `adherent.certificat` est un STATUT d'upload ('UPLOADED'…), inutilisable
+      // comme valeur du select. Taïso → 'SP' ; judo, iaïdo et tout autre → 'SC'.
+      const cert = (adherent.pratique === '3') ? 'SP' : 'SC';
+      if (setByName('certificat', cert) || selectByText('certificat', cert === 'SP' ? 'sportif' : 'compétition')) f++;
+      if (adherent.certificat === 'QU') setCheck('chk_questionnaire', true);
+      if (setRadio('fonction', adherent.fonction || '4')) f++;
+      setCheck('newsletter', false);
+      if (ensureIAC()) f++;
+      setCheck('rgpd', true);
+
+      const cpEl  = document.querySelector('[name="cp"]');
+      const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
+
+      if (!hasCP && adherent.code_postal) {
+        const cpTarget = adherent.ville
+          ? `${adherent.code_postal} ${adherent.ville}`
+          : adherent.code_postal;
+        if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
+        await wait(1200);
+        if (adherent.adresse) {
+          if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
+        }
+      }
+
+      await wait(400);
+      restoreBelt(beltSnap);
+      ensureIAC();
+      await wait(300);
+
+      // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
+      const oui = document.querySelector('input[name="souscription"][value="0"]');
+      if (!oui || !oui.checked) ensureIAC();
+
+      const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
+        .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
+      if (suivant) { suivant.click(); f++; }
+      return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
+    }
+
+    return { error: `Action inconnue : ${action}` };
+  }
+
+  root.FfjdaFlow = { detectStep, applyStep };
+})(typeof self !== 'undefined' ? self : this);
+
+
+
 (function () {
   'use strict';
 
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.2.0';
-
-  // ================================================================
-  // Contexte page : jQuery de la page cible (peut être sandboxé selon
-  // le gestionnaire de scripts dès qu'un @grant est déclaré).
-  // ================================================================
-  const pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-  const $jq = pageWindow.jQuery;
+  const SCRIPT_VERSION = '1.3.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -123,342 +536,15 @@
   }
 
   // ================================================================
-  // Détection d'étape FFJDA (identique à l'extension Chrome)
+  // Automatisation FFJDA — voir lib/ffjda-flow.js (source unique)
   // ================================================================
-  function detectStep(url) {
-    if (!url) return null;
-    if (/\/fiche-licence\/select\//.test(url))                              return 'renew_fiche';
-    if (url.includes('/achat-licence/renouvellement-licence-club/etape_1')) return 'renew_form';
-    if (url.includes('/renouvellement-licencie-club')) {
-      // "RECHERCHER" NAVIGUE vers cette même URL avec les critères en query
-      // string (?nom=…&prenom=…#resultats_recherche) puis charge les résultats
-      // en asynchrone. Sans distinguer les deux états, on re-remplirait le
-      // formulaire en boucle au lieu d'attendre les résultats.
-      return (/[?&]nom=[^&#]/.test(url) || url.includes('resultats_recherche'))
-        ? 'renew_results'
-        : 'renew_search';
-    }
-    if (url.includes('/achat-licence/creation-licence-club/etape_1'))       return 'etape2';
-    if (url.includes('/saisir-licence/etape-2'))                            return 'intermediaire';
-    if (url.includes('/saisir-licence'))                                     return 'etape1';
-    if (url.includes('/prise-licence'))                                      return 'depart';
-    return null;
-  }
-
-  // ================================================================
-  // Remplissage — portage à l'identique des fonctions injectées par
-  // l'extension (extension/background/background.js), sans passer par
-  // chrome.scripting puisqu'on tourne déjà dans le contexte de la page.
-  // ================================================================
-  // Écrit dans un champ via le setter natif du prototype : les formulaires
-  // FFJDA sont pilotés par un framework qui suit sa propre copie de la valeur
-  // et ignore une écriture directe `el.value = …` (il soumettrait un champ
-  // vide). Le setter natif déclenche son tracking, comme une frappe clavier.
-  function setNativeValue(el, val) {
-    const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
-                : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
-                : HTMLInputElement.prototype;
-    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    try { el.focus(); } catch (e) {}
-    if (desc && desc.set) desc.set.call(el, val); else el.value = val;
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur',   { bubbles: true }));
-  }
-
-  async function fillEtape1(adherent) {
-    function set(name, val) {
-      const el = document.querySelector(`[name="${name}"]`);
-      if (!el || val == null) return false;
-      setNativeValue(el, val);
-      return true;
-    }
-    let f = 0;
-    if (set('nom',       adherent.nom))                       f++;
-    if (set('prenom',    adherent.prenom))                    f++;
-    if (set('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
-    if (set('naissance', adherent.date_naissance || ''))      f++;
-
-    // Laisse le framework enregistrer la saisie avant de valider.
-    await new Promise(r => setTimeout(r, 400));
-
-    // Relit les champs : s'ils sont vides, la validation échouerait sans
-    // jamais naviguer — autant le signaler tout de suite.
-    const read = n => { const el = document.querySelector(`[name="${n}"]`); return el ? el.value : null; };
-    const state = { nom: read('nom'), prenom: read('prenom'), naissance: read('naissance') };
-
-    const btn = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
-      .find(b => ((b.textContent || b.value || '').trim().toLowerCase()).includes('valider'));
-    if (btn) {
-      ['mousedown', 'mouseup', 'click'].forEach(type =>
-        btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }))
-      );
-    }
-    return { step: 1, success: f > 0 && !!state.nom && !!state.prenom, filled: f, submitted: !!btn, ...state };
-  }
-
-  function clickCreerLicence() {
-    const btn = Array.from(document.querySelectorAll('a.big-btn'))
-      .find(a => a.textContent.trim().toLowerCase().includes('créer une licence'));
-    if (btn) { btn.click(); return true; }
-    return false;
-  }
-
-  function fillEtape2(adherent) {
-    function norm(s) { return (s || '').toUpperCase().replace(/-/g, ' '); }
-    function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
-    // Même contrainte qu'à l'étape 1 : passer par le setter natif, sinon le
-    // framework FFJDA ignore la saisie.
-    function si(name, val) {
-      const el = document.querySelector(`[name="${name}"]`);
-      if (!el || val == null) return false;
-      setNativeValue(el, val);
-      return true;
-    }
-    function ss(name, val) {
-      const el = document.querySelector(`[name="${name}"]`);
-      if (!el || val == null) return false;
-      setNativeValue(el, val);
-      return true;
-    }
-    function sr(name, val) {
-      const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
-      if (!el) return false;
-      if (!el.checked) el.click();
-      el.checked = true;
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    function sc(id, checked) {
-      const el = document.getElementById(id) || document.querySelector(`input[name="${id}"]`);
-      if (!el) return false;
-      el.checked = checked;
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    function ensureIAC() {
-      const oui = document.querySelector('input[name="souscription"][value="0"]');
-      const non = document.querySelector('input[name="souscription"][value="1"]');
-      if (non) non.checked = false;
-      let okRadio = false;
-      if (oui) {
-        if (!oui.checked) oui.click();
-        oui.checked = true;
-        const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
-        if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        oui.checked = true;
-        oui.dispatchEvent(new Event('input',  { bubbles: true }));
-        oui.dispatchEvent(new Event('change', { bubbles: true }));
-        okRadio = oui.checked;
-      }
-      let okCase = false;
-      const ass = document.querySelector('input[name="assurance"]');
-      if (ass) {
-        if (!ass.checked) ass.click();
-        ass.checked = true;
-        ass.dispatchEvent(new Event('input',  { bubbles: true }));
-        ass.dispatchEvent(new Event('change', { bubbles: true }));
-        okCase = ass.checked;
-      }
-      return okRadio || okCase;
-    }
-    function normText(s) {
-      return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-    }
-    function ssByText(name, text) {
-      const sel = document.querySelector(`select[name="${name}"]`);
-      if (!sel) return false;
-      const nt = normText(text);
-      const opt = Array.from(sel.options).find(o => normText(o.textContent).includes(nt));
-      if (!opt) return false;
-      sel.value = opt.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    function clickOpt(el) {
-      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
-        el.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }))
-      );
-    }
-    function fillSelect2(selectName, searchText, targetText) {
-      return new Promise(resolve => {
-        if (!$jq) { resolve(false); return; }
-        $jq('.select2-container--open [name]').each(function () {
-          try { $jq(this).select2('close'); } catch (e) {}
-        });
-        const $sel = $jq(`[name="${selectName}"]`);
-        if (!$sel.length || !$sel.data('select2')) { resolve(false); return; }
-        setTimeout(() => {
-          $sel.select2('open');
-          setTimeout(() => {
-            const input = document.querySelector('.select2-container--open .select2-search__field');
-            if (!input) { $sel.select2('close'); resolve(false); return; }
-            input.focus(); input.value = searchText;
-            input.dispatchEvent(new Event('input',         { bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-            setTimeout(() => {
-              const opts = document.querySelectorAll(
-                '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
-              );
-              const nt = norm(targetText);
-              let match = Array.from(opts).find(o => norm(o.textContent).includes(nt));
-              if (!match && opts[0]) match = opts[0];
-              if (match) { clickOpt(match); setTimeout(() => resolve(true), 400); }
-              else { $sel.select2('close'); resolve(false); }
-            }, 1500);
-          }, 500);
-        }, 200);
-      });
-    }
-
-    function snapshotBelt() {
-      return Array.from(document.querySelectorAll('[name*="ceinture"], [name*="grade"]'))
-        .map(el => ({ el, value: el.value, checked: el.checked }));
-    }
-    function restoreBelt(snap) {
-      snap.forEach(({ el, value, checked }) => {
-        let changed = false;
-        if (el.type === 'checkbox' || el.type === 'radio') {
-          if (el.checked !== checked) { el.checked = checked; changed = true; }
-        } else if (el.value !== value) {
-          el.value = value; changed = true;
-        }
-        if (changed) el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-    }
-
-    let f = 0;
-    const beltSnap = snapshotBelt();
-    if (adherent.telephone) si('portable', adherent.telephone) && f++;
-    if (adherent.email) {
-      si('mail',         adherent.email) && f++;
-      si('mail-confirm', adherent.email) && f++;
-    }
-    if (adherent.dojo && ss('dojo-code', adherent.dojo)) f++;
-    if (ss('pratiques_1', adherent.pratique || '1')) f++;
-    const tpl = (adherent.pratique === '1' || adherent.pratique === '13') ? 'C' : 'L';
-    if (sr('type_pratique_1', tpl)) f++;
-    sr('handicap', '0');
-    const cert = (adherent.pratique === '3') ? 'SP' : 'SC';
-    if (ss('certificat', cert) || ssByText('certificat', cert === 'SP' ? 'sportif' : 'compétition')) f++;
-    if (adherent.certificat === 'QU') sc('chk_questionnaire', true);
-    if (sr('fonction', adherent.fonction || '4')) f++;
-    sc('newsletter', false);
-    if (ensureIAC()) f++;
-    sc('rgpd', true);
-
-    const cpEl  = document.querySelector('[name="cp"]');
-    const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
-
-    const doAddr = () => {
-      if (hasCP || !adherent.code_postal) return Promise.resolve();
-      const cpTarget = adherent.ville ? `${adherent.code_postal} ${adherent.ville}` : adherent.code_postal;
-      return fillSelect2('cp', adherent.code_postal, cpTarget)
-        .then(ok => { if (ok) f++; return wait(1200); })
-        .then(() => {
-          if (!adherent.adresse) return;
-          return fillSelect2('adresse', adherent.adresse, adherent.adresse).then(ok => { if (ok) f++; });
-        });
-    };
-
-    return doAddr().then(() => wait(400)).then(() => {
-      restoreBelt(beltSnap);
-      ensureIAC();
-      return wait(300);
-    }).then(() => {
-      const oui = document.querySelector('input[name="souscription"][value="0"]');
-      if (!oui || !oui.checked) ensureIAC();
-      const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
-        .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-      if (suivant) { suivant.click(); f++; }
-      return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
-    });
-  }
-
-  // Retourne { clicked, nom, prenom, btn, reason } — les valeurs relues
-  // servent à diagnostiquer une saisie que le framework aurait ignorée.
-  async function fillSearchForm(adherent) {
-    // Affecter `el.value` ne suffit pas : les formulaires FFJDA sont pilotés
-    // par un framework qui suit sa propre copie de la valeur et ignore une
-    // écriture directe — il soumettrait alors un champ vide. Passer par le
-    // setter natif du prototype déclenche le tracking du framework, comme le
-    // ferait une vraie frappe clavier.
-    function setFieldValue(el, val) {
-      const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
-                  : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
-                  : HTMLInputElement.prototype;
-      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-      try { el.focus(); } catch (e) {}
-      if (desc && desc.set) desc.set.call(el, val); else el.value = val;
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur',   { bubbles: true }));
-    }
-
-    const nomEl    = document.querySelector('[name="nom"]');
-    const prenomEl = document.querySelector('[name="prenom"]');
-    if (nomEl)    setFieldValue(nomEl,    adherent.nom);
-    if (prenomEl) setFieldValue(prenomEl, adherent.prenom);
-
-    // Laisse au framework le temps d'enregistrer la saisie avant de soumettre.
-    await new Promise(r => setTimeout(r, 350));
-
-    // Le bouton peut être un <button> ou un <input type="submit"> ; on ignore
-    // "AFFICHER TOUTES LES LICENCES" (qui ne contient pas "RECHERCHER").
-    const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
-      .find(b => ((b.textContent || b.value || '').trim().toUpperCase()).includes('RECHERCHER'));
-    const state = {
-      nom:    nomEl    ? nomEl.value    : null,
-      prenom: prenomEl ? prenomEl.value : null,
-    };
-    if (!btn) return Object.assign({ clicked: false, reason: 'Bouton RECHERCHER introuvable' }, state);
-
-    // Séquence de clic complète : certains handlers écoutent mousedown/mouseup
-    // plutôt que click.
-    ['mousedown', 'mouseup', 'click'].forEach(type =>
-      btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }))
-    );
-    return Object.assign({ clicked: true, btn: (btn.textContent || btn.value || '').trim() }, state);
-  }
-
-  function findLicenceLink(adherent) {
-    function norm(s) {
-      return (s || '').toUpperCase()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        .replace(/[\s-]+/g, ' ').trim();
-    }
-    const nomA    = norm(adherent.nom);
-    const prenomA = norm(adherent.prenom);
-    // C'est le lien PORTANT LE NOM ("FICHET CELINE") qui ouvre la fiche de
-    // renouvellement. Le lien "Fiche licence" de la même ligne mène à la
-    // consultation — une impasse qui ne se rend pas (page blanche). On cible
-    // donc le nom, et on le CLIQUE (son href est souvent piloté en JS).
-    // Pas de filtre sur [href] : le lien peut n'en porter aucun.
-    const match = Array.from(document.querySelectorAll('a')).find(a => {
-      const t = norm(a.textContent);
-      return t.includes(nomA) && t.includes(prenomA);
-    });
-    if (match) return { found: true, el: match };
-    const noResult = Array.from(document.querySelectorAll('p, div, span'))
-      .some(el => el.textContent.toLowerCase().includes('aucun licencié'));
-    return { found: false, noResult };
-  }
-
-  function clickRenewButton() {
-    const candidates = Array.from(document.querySelectorAll('a, button'));
-    const btn = candidates.find(el => {
-      const t = el.textContent.trim().toLowerCase();
-      return t.includes('renouveler') || t.includes('renouvellement');
-    });
-    if (btn) { btn.click(); return { clicked: true, text: btn.textContent.trim() }; }
-    return {
-      clicked: false,
-      available: candidates
-        .filter(el => el.textContent.trim().length > 1 && el.textContent.trim().length < 60)
-        .map(el => el.textContent.trim())
-        .slice(0, 10)
-    };
+  // detectStep() et applyStep() sont partagés avec l'extension Chrome et
+  // concaténés ici au build (scripts/build-userscript.js). Un correctif sur
+  // le parcours FFJDA ne s'écrit donc qu'une fois.
+  const { detectStep, applyStep } = (self.FfjdaFlow || {});
+  if (!detectStep) {
+    console.error('[JCCR] lib/ffjda-flow.js absent — script mal construit.');
+    return;
   }
 
   async function pollForResults(adherent, timeoutMs = 15000) {
@@ -466,7 +552,7 @@
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 500));
       try {
-        const r = findLicenceLink(adherent);
+        const r = await applyStep('findLink', adherent);
         if (r && r.found)    return r;
         if (r && r.noResult) return { found: false, noResult: true };
       } catch (e) {}
@@ -578,7 +664,7 @@
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — recherche...`, 'info');
         await new Promise(r => setTimeout(r, 1000));
         try {
-          const r = await fillSearchForm(adherent);
+          const r = await applyStep('search', adherent);
           if (!r || !r.clicked) {
             const why = (r && r.reason) || 'Bouton RECHERCHER introuvable';
             await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
@@ -606,7 +692,7 @@
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ouverture fiche...`, 'info');
         // Clic (et non navigation) : c'est le geste humain, et il fonctionne
         // que le lien porte une vraie URL ou qu'il soit piloté en JS.
-        res.el.click();
+        await applyStep('clickLink', adherent);
         await failIfNoNavigation(flow, adherent, 'Clic sur le nom sans effet (fiche non ouverte)');
       } else if (res.noResult) {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
@@ -622,7 +708,7 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — fiche licence, clic renouveler...`, 'info');
       await new Promise(r => setTimeout(r, 1200));
       try {
-        const r = clickRenewButton();
+        const r = await applyStep('clickRenew', adherent);
         if (r && r.clicked) {
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — renouvellement en cours...`, 'info');
           await failIfNoNavigation(flow, adherent, 'Clic "Renouveler" sans effet');
@@ -642,7 +728,7 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — formulaire renouvellement...`, 'info');
       await new Promise(r => setTimeout(r, 1200));
       try {
-        const r = await fillEtape2(adherent);
+        const r = await applyStep('etape2', adherent);
         if (!r) {
           await setStatus(`Renouvellement [${idx + 1}] : pas de réponse.`, 'error');
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
@@ -669,7 +755,7 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1...`, 'info');
       await new Promise(r => setTimeout(r, 800));
       try {
-        const r = await fillEtape1(adherent);
+        const r = await applyStep('etape1', adherent);
         if (!r || !r.success) {
           const why = (r && (!r.nom || !r.prenom))
             ? `Étape 1 : champs non pris en compte (nom="${(r && r.nom) || ''}", prénom="${(r && r.prenom) || ''}")`
@@ -691,7 +777,7 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — création licence...`, 'info');
       await new Promise(r => setTimeout(r, 1000));
       try {
-        const ok = clickCreerLicence();
+        const ok = await applyStep('clickCreate', adherent);
         if (!ok) {
           await setStatus('Bouton "créer une licence" introuvable.', 'error');
           await finishAdherent(flow, adherent, false, 'Bouton "créer une licence" introuvable');
@@ -709,7 +795,7 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 2...`, 'info');
       await new Promise(r => setTimeout(r, 1200));
       try {
-        const r = await fillEtape2(adherent);
+        const r = await applyStep('etape2', adherent);
         if (!r) {
           await setStatus(`Étape 2 [${idx + 1}] : pas de réponse.`, 'error');
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
