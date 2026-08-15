@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.1
+// @version      1.3.2
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -189,8 +189,15 @@
 
     if (action === 'findLink') {
       if (findNameLink()) return { found: true };
+      // FFJDA formule différemment selon le contexte : "Aucun licencié...",
+      // "Aucune licence à renouveler", "Aucune licence trouvée"... On vérifie
+      // "aucun" + ("licenc" ou "résultat") plutôt qu'une phrase figée, sinon
+      // le polling tourne jusqu'à son timeout de 15s au lieu d'échouer net.
       const noResult = Array.from(document.querySelectorAll('p, div, span'))
-        .some(el => el.textContent.toLowerCase().includes('aucun licencié'));
+        .some(el => {
+          const t = el.textContent.toLowerCase();
+          return t.includes('aucun') && (t.includes('licenc') || t.includes('résultat') || t.includes('resultat'));
+        });
       return { found: false, noResult };
     }
 
@@ -430,6 +437,22 @@
       return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
     }
 
+    // Après le clic "Suivant" de l'étape 2, FFJDA peut refuser en base (adresse
+    // select2 mal résolue, doublon...) et réafficher un modal d'erreur SANS
+    // changer d'URL de façon fiable — le comptage `f > 0` de l'étape 2 ne le
+    // voit pas puisqu'il ne reflète que "des champs ont été remplis", pas que
+    // l'enregistrement serveur a réussi. Vu en prod : "ERREUR LORS DE
+    // L'ENREGISTREMENT DE LA LICENCE — An error occurred while updating the
+    // entries." (Driouach, Reniez).
+    if (action === 'checkError') {
+      const el = Array.from(document.querySelectorAll('div, p, span, h1, h2, h3, h4'))
+        .find(e => {
+          const t = (e.textContent || '').toUpperCase();
+          return t.includes('ERREUR') && (t.includes('ENREGISTREMENT') || t.includes('UPDATING THE ENTRIES'));
+        });
+      return { hasError: !!el, errorText: el ? el.textContent.trim().replace(/\s+/g, ' ').slice(0, 300) : '' };
+    }
+
     return { error: `Action inconnue : ${action}` };
   }
 
@@ -444,7 +467,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.1';
+  const SCRIPT_VERSION = '1.3.2';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -695,6 +718,16 @@
         await applyStep('clickLink', adherent);
         await failIfNoNavigation(flow, adherent, 'Clic sur le nom sans effet (fiche non ouverte)');
       } else if (res.noResult) {
+        // FFJDA ne le/la liste pas parmi les licenciés éligibles au renouvellement
+        // — on retente en création plutôt que d'échouer, une seule fois.
+        if (modeOf(adherent, flow) === 'renouvellement' && !adherent._fallbackTried) {
+          adherent._mode = 'nouvelle';
+          adherent._fallbackTried = true;
+          await storeSet('flow', flow);
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — pas de licence à renouveler, tentative en création...`, 'info');
+          location.href = 'https://moncompte.ffjudo.com/espace-club/prise-licence/saisir-licence';
+          return;
+        }
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
         await finishAdherent(flow, adherent, false, 'Non trouvé (pas de licence active FFJDA)', 3000);
       } else {
@@ -735,6 +768,15 @@
           return;
         }
         if (r.success) {
+          // Voir le commentaire équivalent côté extension Chrome (background.js) :
+          // le clic "Suivant" ne garantit pas que FFJDA a accepté en base.
+          await new Promise(res => setTimeout(res, 1500));
+          const err = await applyStep('checkError', adherent);
+          if (err && err.hasError) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+            return;
+          }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
           apiMarkSaisie(adherent);
           await finishAdherent(flow, adherent, true, null, 2500);
@@ -802,6 +844,13 @@
           return;
         }
         if (r.success) {
+          await new Promise(res => setTimeout(res, 1500));
+          const err = await applyStep('checkError', adherent);
+          if (err && err.hasError) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+            return;
+          }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
           apiMarkSaisie(adherent);
           await finishAdherent(flow, adherent, true, null, 2500);
