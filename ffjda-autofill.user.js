@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.2
+// @version      1.3.3
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -350,7 +350,18 @@
                   '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
                 );
                 const nt = normOpt(targetText);
-                let match = Array.from(opts).find(o => normOpt(o.textContent).includes(nt));
+                const candidates = Array.from(opts).filter(o => normOpt(o.textContent).includes(nt));
+                // Le premier résultat est souvent un simple écho de la saisie
+                // libre (texte tel que tapé, pas une adresse validée) — la
+                // vraie adresse de la base FFJDA apparaît juste en dessous, en
+                // MAJUSCULES. La sélectionner en priorité : soumettre l'écho
+                // libre fait échouer l'enregistrement côté serveur FFJDA sans
+                // message clair (vu en prod sur Nardi, Reniez).
+                const upper = candidates.find(o => {
+                  const t = o.textContent.trim();
+                  return t.length > 0 && t === t.toUpperCase() && t !== t.toLowerCase();
+                });
+                let match = upper || candidates[0];
                 if (!match && opts[0]) match = opts[0];
                 if (match) { clickOpt(match); setTimeout(() => resolve(true), 400); }
                 else { $sel.select2('close'); resolve(false); }
@@ -467,7 +478,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.2';
+  const SCRIPT_VERSION = '1.3.3';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
