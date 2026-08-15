@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.9
+// @version      1.3.10
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -437,59 +437,24 @@
       if (ensureIAC()) f++;
       setCheck('rgpd', true);
 
-      // DEBUG TEMPORAIRE — diagnostic du crash "Maximum call stack size
-      // exceeded" (main.js:1768, boucle sur .submit()) : compte les handlers
-      // jQuery liés à 'submit' sur le formulaire, avant/après l'interaction
-      // avec le champ adresse, pour confirmer ou infirmer un double
-      // attachement déclenché par le recalcul FFJDA au select2. À retirer
-      // une fois la cause confirmée.
-      function debugSubmitHandlers(label) {
-        try {
-          const jq = pageJQuery();
-          if (!jq) { console.log('[JCCR-DEBUG]', label, '— pas de jQuery'); return; }
-          const forms = document.querySelectorAll('form');
-          if (!forms.length) { console.log('[JCCR-DEBUG]', label, '— aucun form'); return; }
-          forms.forEach((form, i) => {
-            const events = jq._data ? jq._data(form, 'events') : (jq(form).data('events'));
-            const n = events && events.submit ? events.submit.length : 0;
-            const clickN = events && events.click ? events.click.length : 0;
-            console.log('[JCCR-DEBUG]', label, `— form#${i}`, form.id || form.className || '(sans id)',
-              '—', n, 'submit,', clickN, 'click');
-          });
-        } catch (e) {
-          console.log('[JCCR-DEBUG]', label, '— erreur:', e.message);
-        }
-      }
-
       const cpEl  = document.querySelector('[name="cp"]');
       const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
-
-      debugSubmitHandlers('AVANT interaction adresse');
 
       if (!hasCP && adherent.code_postal) {
         const cpTarget = adherent.ville
           ? `${adherent.code_postal} ${adherent.ville}`
           : adherent.code_postal;
         if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
-        debugSubmitHandlers('APRES select2 cp');
         await wait(1200);
         if (adherent.adresse) {
           if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
-          debugSubmitHandlers('APRES select2 adresse');
         }
       }
 
-      // Délai généreux avant de soumettre : le champ adresse (select2 AJAX)
-      // déclenche une validation/recalcul FFJDA asynchrone (voir ensureIAC),
-      // et un humain laisse toujours plusieurs secondes s'écouler avant de
-      // cliquer Suivant — contrairement à ce script. Un clic trop rapide
-      // pourrait tomber en plein milieu de ce recalcul et faire boucler le
-      // handler de soumission de FFJDA (main.js). Essai : 3s au lieu de 700ms.
-      await wait(3000);
+      await wait(800);
       restoreBelt(beltSnap);
       ensureIAC();
-      await wait(1000);
-      debugSubmitHandlers('JUSTE AVANT clic Suivant');
+      await wait(400);
 
       // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
       const oui = document.querySelector('input[name="souscription"][value="0"]');
@@ -497,18 +462,6 @@
 
       const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
         .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-
-      // DEBUG TEMPORAIRE — pause ici (si les DevTools sont ouverts) pour
-      // inspecter l'état réel juste avant le clic : contenu de .alert-message,
-      // état "disabled" du bouton, valeur des champs cachés latitude/longitude.
-      console.log('[JCCR-DEBUG] État juste avant clic Suivant :', {
-        alertMessage: document.querySelector('.alert-message') ? document.querySelector('.alert-message').textContent : '(absent)',
-        suivantDisabled: suivant ? suivant.disabled : '(bouton introuvable)',
-        latitudeClub: document.getElementById('latitude-club') ? document.getElementById('latitude-club').value : '(absent)',
-        longitudeClub: document.getElementById('longitude-club') ? document.getElementById('longitude-club').value : '(absent)',
-      });
-      debugger;
-
       if (suivant) { suivant.click(); f++; }
       return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
     }
@@ -543,7 +496,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.9';
+  const SCRIPT_VERSION = '1.3.10';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -745,7 +698,8 @@
   async function handleStep(flowArg) {
     const flow = flowArg || await storeGet('flow', null);
     if (!flow) return;
-    const step = detectStep(location.href);
+    const startUrl = location.href;
+    const step = detectStep(startUrl);
     if (!step) return;
     const adherent = flow.queue[flow.current];
     if (!adherent) return;
@@ -853,6 +807,15 @@
             await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
             return;
           }
+          // Voir le commentaire équivalent côté extension Chrome (background.js) :
+          // un plantage JS synchrone côté FFJDA pendant le clic n'affiche pas
+          // toujours de modale et ne remonte jamais jusqu'ici — seule
+          // l'absence de navigation le trahit.
+          if (location.href === startUrl) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
+            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
+            return;
+          }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
           apiMarkSaisie(adherent);
           await finishAdherent(flow, adherent, true, null, 2500);
@@ -925,6 +888,15 @@
           if (err && err.hasError) {
             await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
             await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+            return;
+          }
+          // Voir le commentaire équivalent côté extension Chrome (background.js) :
+          // un plantage JS synchrone côté FFJDA pendant le clic n'affiche pas
+          // toujours de modale et ne remonte jamais jusqu'ici — seule
+          // l'absence de navigation le trahit.
+          if (location.href === startUrl) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
+            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
             return;
           }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
