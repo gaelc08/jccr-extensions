@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.4.2
+// @version      1.5.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -406,54 +406,77 @@
       if (ensureIAC()) f++;
       setCheck('rgpd', true);
 
-      // Code postal + adresse : LAISSÉS À L'UTILISATEUR, volontairement.
-      // Remplir ces deux champs (select2 AJAX) par script — quelle que soit
-      // la méthode testée : séquence de clic, délai avant soumission, clic
-      // scripté vs humain sur "Suivant" — a systématiquement fini par faire
-      // boucler indéfiniment un handler jQuery du site FFJDA lui-même
-      // (main.js:1768, RangeError: Maximum call stack size exceeded), y
-      // compris quand l'utilisateur cliquait lui-même sur "Suivant" ensuite.
-      // Un remplissage entièrement manuel, lui, n'a jamais reproduit le
-      // crash. Cause exacte non identifiée après investigation poussée :
-      // on laisse donc ces deux champs à une vraie interaction humaine de
-      // bout en bout plutôt que de continuer à deviner.
-      const cpEl = document.querySelector('[name="cp"]');
+      // Champs adresse : select2 alimenté en AJAX, il faut ouvrir, taper, attendre.
+      function fillSelect2(selectName, searchText, targetText) {
+        return new Promise(resolve => {
+          const jq = pageJQuery();
+          if (!jq) { resolve(false); return; }
+          jq('.select2-container--open [name]').each(function () {
+            try { jq(this).select2('close'); } catch (e) {}
+          });
+          const $sel = jq(`[name="${selectName}"]`);
+          if (!$sel.length || !$sel.data('select2')) { resolve(false); return; }
+          setTimeout(() => {
+            $sel.select2('open');
+            setTimeout(() => {
+              const input = document.querySelector('.select2-container--open .select2-search__field');
+              if (!input) { $sel.select2('close'); resolve(false); return; }
+              input.focus(); input.value = searchText;
+              input.dispatchEvent(new Event('input',         { bubbles: true }));
+              input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+              setTimeout(() => {
+                const opts = document.querySelectorAll(
+                  '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
+                );
+                const nt = (targetText || '').toUpperCase().replace(/-/g, ' ');
+                const norm = (s) => (s || '').toUpperCase().replace(/-/g, ' ');
+                const candidates = Array.from(opts).filter(o => norm(o.textContent).includes(nt));
+                // Le premier résultat est souvent un simple écho de la saisie
+                // libre (texte tel que tapé) — la vraie adresse de la base
+                // FFJDA apparaît juste en dessous, en MAJUSCULES. Préférée ici,
+                // même si le vrai coupable des échecs passés était ailleurs
+                // (date de naissance non reformatée, voir etape1).
+                const upper = candidates.find(o => {
+                  const t = o.textContent.trim();
+                  return t.length > 0 && t === t.toUpperCase() && t !== t.toLowerCase();
+                });
+                let match = upper || candidates[0];
+                if (!match && opts[0]) match = opts[0];
+                if (match) { realClick(match); setTimeout(() => resolve(true), 400); }
+                else { $sel.select2('close'); resolve(false); }
+              }, 1500);
+            }, 500);
+          }, 200);
+        });
+      }
+
+      const cpEl  = document.querySelector('[name="cp"]');
       const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
-      if (!hasCP && cpEl) {
-        const cpBox = cpEl.closest('.form-group') || cpEl.parentElement;
-        if (cpBox) {
-          if (!document.getElementById('jccr-pulse-style')) {
-            const style = document.createElement('style');
-            style.id = 'jccr-pulse-style';
-            style.textContent = '@keyframes jccr-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,45,85,0.7); } 50% { box-shadow: 0 0 0 10px rgba(255,45,85,0); } }';
-            document.head.appendChild(style);
-          }
-          cpBox.style.outline = '4px solid #ff2d55';
-          cpBox.style.animation = 'jccr-pulse 1s infinite';
-          cpBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      if (!hasCP && adherent.code_postal) {
+        const cpTarget = adherent.ville
+          ? `${adherent.code_postal} ${adherent.ville}`
+          : adherent.code_postal;
+        if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
+        await wait(1200);
+        if (adherent.adresse) {
+          if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
         }
       }
 
-      await wait(400);
+      await wait(800);
       restoreBelt(beltSnap);
+      ensureIAC();
+      await wait(400);
+
+      // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
+      const oui = document.querySelector('input[name="souscription"][value="0"]');
+      if (!oui || !oui.checked) ensureIAC();
 
       const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
         .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-
-      // On NE CLIQUE PAS nous-mêmes — voir le commentaire sur CP/adresse
-      // ci-dessus. Mis en évidence pour être facile à repérer.
-      if (suivant) {
-        suivant.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        if (!document.getElementById('jccr-pulse-style')) {
-          const style = document.createElement('style');
-          style.id = 'jccr-pulse-style';
-          style.textContent = '@keyframes jccr-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,45,85,0.7); } 50% { box-shadow: 0 0 0 10px rgba(255,45,85,0); } }';
-          document.head.appendChild(style);
-        }
-        suivant.style.outline = '4px solid #ff2d55';
-        suivant.style.animation = 'jccr-pulse 1s infinite';
-      }
-      return { step: 2, success: f > 0, filled: f, readyForManualClick: !!suivant };
+      if (suivant) { suivant.click(); f++; }
+      return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
     }
 
     // Après le clic "Suivant" de l'étape 2, FFJDA peut refuser en base (adresse
@@ -486,7 +509,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.4.2';
+  const SCRIPT_VERSION = '1.5.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -633,37 +656,6 @@
     await finishAdherent(flow, adherent, false, reason, 1500);
   }
 
-  // Le formulaire est rempli mais le bouton "Suivant" (mis en évidence côté
-  // page par etape2) n'a PAS été cliqué par le script : un clic scripté sur
-  // ce bouton fait boucler indéfiniment un handler jQuery bugué du site
-  // FFJDA (main.js), jamais un vrai clic humain. On enregistre qu'on attend
-  // ce clic (flow.awaitingManualSubmit, persisté — cette page va être
-  // remplacée par la navigation que le clic humain va déclencher, détruisant
-  // ce contexte de script) puis on surveille juste l'apparition d'une modale
-  // d'erreur SANS navigation (échec détectable ici). Le succès (navigation)
-  // est détecté au chargement de la page suivante, en tête de handleStep().
-  async function waitForManualSubmitLocal(flow, adherent, idx, total, fromUrl, timeoutMs = 600000) {
-    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — remplis le code postal + l'adresse (surlignés), vérifie que "Oui" (assurance) est coché, puis clique sur "Suivant" toi-même ↴`, 'info');
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, 800));
-      if (location.href !== fromUrl) return; // navigation en cours, la page suivante prend le relais
-      try {
-        const err = await applyStep('checkError', adherent);
-        if (err && err.hasError) {
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-          delete flow.awaitingManualSubmit;
-          await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 1500);
-          return;
-        }
-      } catch (e) { /* on retente au prochain tour */ }
-    }
-    if (location.href !== fromUrl) return;
-    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — pas de clic détecté (10 min).`, 'error');
-    delete flow.awaitingManualSubmit;
-    await finishAdherent(flow, adherent, false, 'Pas de clic sur "Suivant" détecté après 10 minutes', 1500);
-  }
-
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
     flow.results.push({ nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null });
     await storeSet('flow', flow);
@@ -720,25 +712,6 @@
     const flow = flowArg || await storeGet('flow', null);
     if (!flow) return;
     const startUrl = location.href;
-
-    // On attendait un clic humain sur "Suivant" (voir waitForManualSubmitLocal)
-    // et on vient de charger une NOUVELLE page — ce contexte de script a été
-    // détruit puis recréé par la navigation, donc c'est bien le signe que le
-    // clic a eu lieu et que FFJDA a accepté la soumission (sinon on serait
-    // resté sur la même URL). Prioritaire sur le routage normal par étape :
-    // la page d'arrivée peut être une confirmation qui ne matche aucune étape.
-    if (flow.awaitingManualSubmit && startUrl !== flow.awaitingManualSubmit.fromUrl) {
-      const adherent = flow.queue[flow.current];
-      delete flow.awaitingManualSubmit;
-      if (adherent) {
-        await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} ✅`, 'success');
-        apiMarkSaisie(adherent);
-        await finishAdherent(flow, adherent, true, null, 500);
-      } else {
-        await storeSet('flow', flow);
-      }
-      return;
-    }
 
     const step = detectStep(startUrl);
     if (!step) return;
@@ -838,13 +811,22 @@
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
           return;
         }
-        if (r.success && r.readyForManualClick) {
-          flow.awaitingManualSubmit = { fromUrl: startUrl };
-          await storeSet('flow', flow);
-          await waitForManualSubmitLocal(flow, adherent, idx, total, startUrl);
-        } else if (r.success) {
-          await setStatus(`Renouvellement [${idx + 1}] : bouton "Suivant" introuvable.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Bouton "Suivant" introuvable');
+        if (r.success) {
+          await new Promise(res => setTimeout(res, 1500));
+          const err = await applyStep('checkError', adherent);
+          if (err && err.hasError) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+            return;
+          }
+          if (location.href === startUrl) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
+            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
+            return;
+          }
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
+          apiMarkSaisie(adherent);
+          await finishAdherent(flow, adherent, true, null, 2500);
         } else {
           await setStatus(`Renouvellement [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
           await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
@@ -908,13 +890,22 @@
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
           return;
         }
-        if (r.success && r.readyForManualClick) {
-          flow.awaitingManualSubmit = { fromUrl: startUrl };
-          await storeSet('flow', flow);
-          await waitForManualSubmitLocal(flow, adherent, idx, total, startUrl);
-        } else if (r.success) {
-          await setStatus(`Étape 2 [${idx + 1}] : bouton "Suivant" introuvable.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Bouton "Suivant" introuvable');
+        if (r.success) {
+          await new Promise(res => setTimeout(res, 1500));
+          const err = await applyStep('checkError', adherent);
+          if (err && err.hasError) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+            return;
+          }
+          if (location.href === startUrl) {
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
+            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
+            return;
+          }
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
+          apiMarkSaisie(adherent);
+          await finishAdherent(flow, adherent, true, null, 2500);
         } else {
           await setStatus(`Étape 2 [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
           await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
