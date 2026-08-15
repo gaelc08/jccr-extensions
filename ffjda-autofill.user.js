@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.3
+// @version      1.3.4
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -321,11 +321,16 @@
         return okRadio || okCase;
       }
 
-      function clickOpt(el) {
-        ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
-          el.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }))
-        );
-      }
+      // Alias de realClick() (définie plus haut, même portée `applyStep`) :
+      // clickOpt() envoyait en plus 'mouseenter'/'mouseover' avant la
+      // séquence mousedown/mouseup/click. Repéré en prod (Nardi, adresse
+      // "6 RUELLE DES VIOLETTES") : cette séquence à 5 événements fait
+      // boucler indéfiniment un handler jQuery de FFJDA lui-même
+      // ("Uncaught RangeError: Maximum call stack size exceeded", main.js
+      // se re-déclenchant en triggant le même événement). Un clic humain, ou
+      // la séquence à 3 événements de realClick() déjà utilisée ailleurs
+      // (bouton RECHERCHER), ne reproduit pas le crash.
+      const clickOpt = realClick;
 
       // Champs adresse : select2 alimenté en AJAX, il faut ouvrir, taper, attendre.
       function fillSelect2(selectName, searchText, targetText) {
@@ -478,7 +483,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.3';
+  const SCRIPT_VERSION = '1.3.4';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
