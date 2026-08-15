@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.0
+// @version      1.3.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -444,7 +444,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.0';
+  const SCRIPT_VERSION = '1.3.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -831,8 +831,13 @@
     const tier = (a.tier || '').toLowerCase();
     return a.pratique === '13' || tier.includes('iaido') || tier.includes('iaïdo') || tier.includes('cercle');
   }
+  // `had_licence_any_season` : a déjà eu une licence FFJDA une saison passée,
+  // même si pas encore renouvelée pour la saison en cours (recon_status
+  // resterait "unmatched" sinon) — sans ce signal la saisie repart en
+  // "nouvelle licence" et FFJDA refuse le doublon de profil.
   function hasLicenceFFJDA(a) {
-    return !!a.ffjda_licence || a.recon_status === 'matched' || a.recon_status === 'corrected';
+    return !!a.ffjda_licence || a.recon_status === 'matched' || a.recon_status === 'corrected'
+      || !!a.had_licence_any_season;
   }
 
   function injectStyle() {
