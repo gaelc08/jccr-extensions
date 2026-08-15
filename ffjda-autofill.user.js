@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.5
+// @version      1.3.6
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -437,17 +437,40 @@
       if (ensureIAC()) f++;
       setCheck('rgpd', true);
 
+      // DEBUG TEMPORAIRE — diagnostic du crash "Maximum call stack size
+      // exceeded" (main.js:1768, boucle sur .submit()) : compte les handlers
+      // jQuery liés à 'submit' sur le formulaire, avant/après l'interaction
+      // avec le champ adresse, pour confirmer ou infirmer un double
+      // attachement déclenché par le recalcul FFJDA au select2. À retirer
+      // une fois la cause confirmée.
+      function debugSubmitHandlers(label) {
+        try {
+          const jq = pageJQuery();
+          const form = document.querySelector('form');
+          if (!jq || !form) { console.log('[JCCR-DEBUG]', label, '— pas de jQuery/form'); return; }
+          const events = jq._data ? jq._data(form, 'events') : (jq(form).data('events'));
+          const n = events && events.submit ? events.submit.length : 0;
+          console.log('[JCCR-DEBUG]', label, '—', n, 'handler(s) submit sur', form.id || form.className || '(form sans id)');
+        } catch (e) {
+          console.log('[JCCR-DEBUG]', label, '— erreur:', e.message);
+        }
+      }
+
       const cpEl  = document.querySelector('[name="cp"]');
       const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
+
+      debugSubmitHandlers('AVANT interaction adresse');
 
       if (!hasCP && adherent.code_postal) {
         const cpTarget = adherent.ville
           ? `${adherent.code_postal} ${adherent.ville}`
           : adherent.code_postal;
         if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
+        debugSubmitHandlers('APRES select2 cp');
         await wait(1200);
         if (adherent.adresse) {
           if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
+          debugSubmitHandlers('APRES select2 adresse');
         }
       }
 
@@ -455,6 +478,7 @@
       restoreBelt(beltSnap);
       ensureIAC();
       await wait(300);
+      debugSubmitHandlers('JUSTE AVANT clic Suivant');
 
       // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
       const oui = document.querySelector('input[name="souscription"][value="0"]');
@@ -496,7 +520,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.5';
+  const SCRIPT_VERSION = '1.3.6';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
