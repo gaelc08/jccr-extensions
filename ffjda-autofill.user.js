@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.4.0
+// @version      1.4.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -99,9 +99,6 @@
     function normText(s) {
       return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
     }
-    // Comparaison des options select2 (tirets assimilés à des espaces).
-    function normOpt(s) { return (s || '').toUpperCase().replace(/-/g, ' '); }
-
     // Affecter `el.value` ne suffit pas : les formulaires FFJDA sont pilotés
     // par un framework qui suit sa propre copie de la valeur et ignore une
     // écriture directe — il soumettrait alors un champ vide. Le setter natif
@@ -334,60 +331,15 @@
         return okRadio || okCase;
       }
 
-      // Alias de realClick() (définie plus haut, même portée `applyStep`) :
-      // clickOpt() envoyait en plus 'mouseenter'/'mouseover' avant la
-      // séquence mousedown/mouseup/click. Repéré en prod (Nardi, adresse
-      // "6 RUELLE DES VIOLETTES") : cette séquence à 5 événements fait
-      // boucler indéfiniment un handler jQuery de FFJDA lui-même
-      // ("Uncaught RangeError: Maximum call stack size exceeded", main.js
-      // se re-déclenchant en triggant le même événement). Un clic humain, ou
-      // la séquence à 3 événements de realClick() déjà utilisée ailleurs
-      // (bouton RECHERCHER), ne reproduit pas le crash.
-      const clickOpt = realClick;
-
-      // Champs adresse : select2 alimenté en AJAX, il faut ouvrir, taper, attendre.
-      function fillSelect2(selectName, searchText, targetText) {
-        return new Promise(resolve => {
-          const jq = pageJQuery();
-          if (!jq) { resolve(false); return; }
-          jq('.select2-container--open [name]').each(function () {
-            try { jq(this).select2('close'); } catch (e) {}
-          });
-          const $sel = jq(`[name="${selectName}"]`);
-          if (!$sel.length || !$sel.data('select2')) { resolve(false); return; }
-          setTimeout(() => {
-            $sel.select2('open');
-            setTimeout(() => {
-              const input = document.querySelector('.select2-container--open .select2-search__field');
-              if (!input) { $sel.select2('close'); resolve(false); return; }
-              input.focus(); input.value = searchText;
-              input.dispatchEvent(new Event('input',         { bubbles: true }));
-              input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-              setTimeout(() => {
-                const opts = document.querySelectorAll(
-                  '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
-                );
-                const nt = normOpt(targetText);
-                const candidates = Array.from(opts).filter(o => normOpt(o.textContent).includes(nt));
-                // Le premier résultat est souvent un simple écho de la saisie
-                // libre (texte tel que tapé, pas une adresse validée) — la
-                // vraie adresse de la base FFJDA apparaît juste en dessous, en
-                // MAJUSCULES. La sélectionner en priorité : soumettre l'écho
-                // libre fait échouer l'enregistrement côté serveur FFJDA sans
-                // message clair (vu en prod sur Nardi, Reniez).
-                const upper = candidates.find(o => {
-                  const t = o.textContent.trim();
-                  return t.length > 0 && t === t.toUpperCase() && t !== t.toLowerCase();
-                });
-                let match = upper || candidates[0];
-                if (!match && opts[0]) match = opts[0];
-                if (match) { clickOpt(match); setTimeout(() => resolve(true), 400); }
-                else { $sel.select2('close'); resolve(false); }
-              }, 1500);
-            }, 500);
-          }, 200);
-        });
-      }
+      // fillSelect2() (remplissage scripté du CP/adresse via select2) a été
+      // retirée : quelle que soit la variante testée (séquence de clic,
+      // délai avant soumission, choix de l'option en majuscule, clic humain
+      // vs scripté sur "Suivant"...), elle a systématiquement fini par faire
+      // boucler indéfiniment un handler jQuery du site FFJDA lui-même
+      // (main.js:1768). Cause exacte non identifiée après investigation
+      // poussée — un remplissage manuel de bout en bout, lui, n'a jamais
+      // reproduit le crash. Ces deux champs sont donc désormais laissés à
+      // l'utilisateur (voir plus bas, mise en évidence de #cp).
 
       // Garde ceinture/grade : on n'y touche JAMAIS, mais un autre champ
       // (discipline, adresse…) peut la réinitialiser par effet de bord côté
@@ -437,40 +389,42 @@
       if (ensureIAC()) f++;
       setCheck('rgpd', true);
 
-      const cpEl  = document.querySelector('[name="cp"]');
+      // Code postal + adresse : LAISSÉS À L'UTILISATEUR, volontairement.
+      // Remplir ces deux champs (select2 AJAX) par script — quelle que soit
+      // la méthode testée : séquence de clic, délai avant soumission, clic
+      // scripté vs humain sur "Suivant" — a systématiquement fini par faire
+      // boucler indéfiniment un handler jQuery du site FFJDA lui-même
+      // (main.js:1768, RangeError: Maximum call stack size exceeded), y
+      // compris quand l'utilisateur cliquait lui-même sur "Suivant" ensuite.
+      // Un remplissage entièrement manuel, lui, n'a jamais reproduit le
+      // crash. Cause exacte non identifiée après investigation poussée :
+      // on laisse donc ces deux champs à une vraie interaction humaine de
+      // bout en bout plutôt que de continuer à deviner.
+      const cpEl = document.querySelector('[name="cp"]');
       const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
-
-      if (!hasCP && adherent.code_postal) {
-        const cpTarget = adherent.ville
-          ? `${adherent.code_postal} ${adherent.ville}`
-          : adherent.code_postal;
-        if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
-        await wait(1200);
-        if (adherent.adresse) {
-          if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
+      if (!hasCP && cpEl) {
+        const cpBox = cpEl.closest('.form-group') || cpEl.parentElement;
+        if (cpBox) {
+          if (!document.getElementById('jccr-pulse-style')) {
+            const style = document.createElement('style');
+            style.id = 'jccr-pulse-style';
+            style.textContent = '@keyframes jccr-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,45,85,0.7); } 50% { box-shadow: 0 0 0 10px rgba(255,45,85,0); } }';
+            document.head.appendChild(style);
+          }
+          cpBox.style.outline = '4px solid #ff2d55';
+          cpBox.style.animation = 'jccr-pulse 1s infinite';
+          cpBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }
 
-      await wait(800);
-      restoreBelt(beltSnap);
-      ensureIAC();
       await wait(400);
-
-      // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
-      const oui = document.querySelector('input[name="souscription"][value="0"]');
-      if (!oui || !oui.checked) ensureIAC();
+      restoreBelt(beltSnap);
 
       const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
         .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
 
-      // On NE CLIQUE PAS nous-mêmes : un clic scripté (isTrusted:false) sur
-      // ce bouton précis déclenche une boucle infinie dans le JS de FFJDA
-      // lui-même (main.js:1768, $(form).submit() qui se rappelle tant que
-      // .alert-message est vide) — bug confirmé ne se produisant qu'avec un
-      // clic scripté, jamais avec un vrai clic humain. Tout le reste du
-      // formulaire est rempli automatiquement ; seul ce dernier clic doit
-      // être un vrai geste humain. On le met en évidence pour qu'il soit
-      // facile à repérer dans un formulaire long.
+      // On NE CLIQUE PAS nous-mêmes — voir le commentaire sur CP/adresse
+      // ci-dessus. Mis en évidence pour être facile à repérer.
       if (suivant) {
         suivant.scrollIntoView({ behavior: 'smooth', block: 'center' });
         if (!document.getElementById('jccr-pulse-style')) {
@@ -515,7 +469,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.4.0';
+  const SCRIPT_VERSION = '1.4.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -672,7 +626,7 @@
   // d'erreur SANS navigation (échec détectable ici). Le succès (navigation)
   // est détecté au chargement de la page suivante, en tête de handleStep().
   async function waitForManualSubmitLocal(flow, adherent, idx, total, fromUrl, timeoutMs = 600000) {
-    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — formulaire prêt, clique sur "Suivant" toi-même ↴`, 'info');
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — remplis le code postal + l'adresse (surlignés), vérifie que "Oui" (assurance) est coché, puis clique sur "Suivant" toi-même ↴`, 'info');
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 800));
