@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.4.1
+// @version      1.4.2
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -256,11 +256,21 @@
     // ── Étape 1 nouvelle licence : identité ──────────────────────────────────
 
     if (action === 'etape1') {
+      // adherent.date_naissance arrive au format ISO (YYYY-MM-DD, tel que
+      // stocké côté API). Le champ FFJDA attend du DD/MM/YYYY — l'y envoyer
+      // tel quel produit une date aberrante (ex. "20/09/0925" vu en prod sur
+      // Nardi) si le champ a un masque de saisie, ce qui a pu contribuer aux
+      // échecs constatés sur les nouvelles licences (jamais reproduits en
+      // renouvellement, qui ne passe pas par ce champ).
+      const isoDob = adherent.date_naissance || '';
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDob);
+      const dob = m ? `${m[3]}/${m[2]}/${m[1]}` : isoDob;
+
       let f = 0;
       if (setByName('nom',       adherent.nom))                       f++;
       if (setByName('prenom',    adherent.prenom))                    f++;
       if (setByName('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
-      if (setByName('naissance', adherent.date_naissance || ''))      f++;
+      if (setByName('naissance', dob))                                 f++;
 
       await wait(400);
 
@@ -271,8 +281,15 @@
         .find(b => ((b.textContent || b.value || '').trim().toLowerCase()).includes('valider'));
       if (btn) realClick(btn);
 
+      // Filet de sécurité : si le champ naissance n'a pas la forme
+      // DD/MM/YYYY attendue après saisie (masque de saisie qui a mal
+      // interprété la valeur envoyée, ou tout autre souci), on ne déclare
+      // pas succès — mieux vaut un échec explicite ici qu'une date
+      // aberrante silencieusement soumise plus loin dans le formulaire.
+      const dobOk = !dob || /^\d{2}\/\d{2}\/\d{4}$/.test(state.naissance || '');
+
       return Object.assign(
-        { step: 1, success: f > 0 && !!state.nom && !!state.prenom, filled: f, submitted: !!btn },
+        { step: 1, success: f > 0 && !!state.nom && !!state.prenom && dobOk, filled: f, submitted: !!btn },
         state
       );
     }
@@ -469,7 +486,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.4.1';
+  const SCRIPT_VERSION = '1.4.2';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
