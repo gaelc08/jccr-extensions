@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.8
+// @version      1.3.9
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -497,6 +497,18 @@
 
       const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
         .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
+
+      // DEBUG TEMPORAIRE — pause ici (si les DevTools sont ouverts) pour
+      // inspecter l'état réel juste avant le clic : contenu de .alert-message,
+      // état "disabled" du bouton, valeur des champs cachés latitude/longitude.
+      console.log('[JCCR-DEBUG] État juste avant clic Suivant :', {
+        alertMessage: document.querySelector('.alert-message') ? document.querySelector('.alert-message').textContent : '(absent)',
+        suivantDisabled: suivant ? suivant.disabled : '(bouton introuvable)',
+        latitudeClub: document.getElementById('latitude-club') ? document.getElementById('latitude-club').value : '(absent)',
+        longitudeClub: document.getElementById('longitude-club') ? document.getElementById('longitude-club').value : '(absent)',
+      });
+      debugger;
+
       if (suivant) { suivant.click(); f++; }
       return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
     }
@@ -531,7 +543,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.8';
+  const SCRIPT_VERSION = '1.3.9';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
