@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.10
+// @version      1.4.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -462,8 +462,27 @@
 
       const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
         .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-      if (suivant) { suivant.click(); f++; }
-      return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
+
+      // On NE CLIQUE PAS nous-mêmes : un clic scripté (isTrusted:false) sur
+      // ce bouton précis déclenche une boucle infinie dans le JS de FFJDA
+      // lui-même (main.js:1768, $(form).submit() qui se rappelle tant que
+      // .alert-message est vide) — bug confirmé ne se produisant qu'avec un
+      // clic scripté, jamais avec un vrai clic humain. Tout le reste du
+      // formulaire est rempli automatiquement ; seul ce dernier clic doit
+      // être un vrai geste humain. On le met en évidence pour qu'il soit
+      // facile à repérer dans un formulaire long.
+      if (suivant) {
+        suivant.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (!document.getElementById('jccr-pulse-style')) {
+          const style = document.createElement('style');
+          style.id = 'jccr-pulse-style';
+          style.textContent = '@keyframes jccr-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,45,85,0.7); } 50% { box-shadow: 0 0 0 10px rgba(255,45,85,0); } }';
+          document.head.appendChild(style);
+        }
+        suivant.style.outline = '4px solid #ff2d55';
+        suivant.style.animation = 'jccr-pulse 1s infinite';
+      }
+      return { step: 2, success: f > 0, filled: f, readyForManualClick: !!suivant };
     }
 
     // Après le clic "Suivant" de l'étape 2, FFJDA peut refuser en base (adresse
@@ -496,7 +515,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.10';
+  const SCRIPT_VERSION = '1.4.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -643,6 +662,37 @@
     await finishAdherent(flow, adherent, false, reason, 1500);
   }
 
+  // Le formulaire est rempli mais le bouton "Suivant" (mis en évidence côté
+  // page par etape2) n'a PAS été cliqué par le script : un clic scripté sur
+  // ce bouton fait boucler indéfiniment un handler jQuery bugué du site
+  // FFJDA (main.js), jamais un vrai clic humain. On enregistre qu'on attend
+  // ce clic (flow.awaitingManualSubmit, persisté — cette page va être
+  // remplacée par la navigation que le clic humain va déclencher, détruisant
+  // ce contexte de script) puis on surveille juste l'apparition d'une modale
+  // d'erreur SANS navigation (échec détectable ici). Le succès (navigation)
+  // est détecté au chargement de la page suivante, en tête de handleStep().
+  async function waitForManualSubmitLocal(flow, adherent, idx, total, fromUrl, timeoutMs = 600000) {
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — formulaire prêt, clique sur "Suivant" toi-même ↴`, 'info');
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, 800));
+      if (location.href !== fromUrl) return; // navigation en cours, la page suivante prend le relais
+      try {
+        const err = await applyStep('checkError', adherent);
+        if (err && err.hasError) {
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+          delete flow.awaitingManualSubmit;
+          await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 1500);
+          return;
+        }
+      } catch (e) { /* on retente au prochain tour */ }
+    }
+    if (location.href !== fromUrl) return;
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — pas de clic détecté (10 min).`, 'error');
+    delete flow.awaitingManualSubmit;
+    await finishAdherent(flow, adherent, false, 'Pas de clic sur "Suivant" détecté après 10 minutes', 1500);
+  }
+
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
     flow.results.push({ nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null });
     await storeSet('flow', flow);
@@ -699,6 +749,26 @@
     const flow = flowArg || await storeGet('flow', null);
     if (!flow) return;
     const startUrl = location.href;
+
+    // On attendait un clic humain sur "Suivant" (voir waitForManualSubmitLocal)
+    // et on vient de charger une NOUVELLE page — ce contexte de script a été
+    // détruit puis recréé par la navigation, donc c'est bien le signe que le
+    // clic a eu lieu et que FFJDA a accepté la soumission (sinon on serait
+    // resté sur la même URL). Prioritaire sur le routage normal par étape :
+    // la page d'arrivée peut être une confirmation qui ne matche aucune étape.
+    if (flow.awaitingManualSubmit && startUrl !== flow.awaitingManualSubmit.fromUrl) {
+      const adherent = flow.queue[flow.current];
+      delete flow.awaitingManualSubmit;
+      if (adherent) {
+        await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} ✅`, 'success');
+        apiMarkSaisie(adherent);
+        await finishAdherent(flow, adherent, true, null, 500);
+      } else {
+        await storeSet('flow', flow);
+      }
+      return;
+    }
+
     const step = detectStep(startUrl);
     if (!step) return;
     const adherent = flow.queue[flow.current];
@@ -797,28 +867,13 @@
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
           return;
         }
-        if (r.success) {
-          // Voir le commentaire équivalent côté extension Chrome (background.js) :
-          // le clic "Suivant" ne garantit pas que FFJDA a accepté en base.
-          await new Promise(res => setTimeout(res, 1500));
-          const err = await applyStep('checkError', adherent);
-          if (err && err.hasError) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
-            return;
-          }
-          // Voir le commentaire équivalent côté extension Chrome (background.js) :
-          // un plantage JS synchrone côté FFJDA pendant le clic n'affiche pas
-          // toujours de modale et ne remonte jamais jusqu'ici — seule
-          // l'absence de navigation le trahit.
-          if (location.href === startUrl) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
-            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
-            return;
-          }
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
-          apiMarkSaisie(adherent);
-          await finishAdherent(flow, adherent, true, null, 2500);
+        if (r.success && r.readyForManualClick) {
+          flow.awaitingManualSubmit = { fromUrl: startUrl };
+          await storeSet('flow', flow);
+          await waitForManualSubmitLocal(flow, adherent, idx, total, startUrl);
+        } else if (r.success) {
+          await setStatus(`Renouvellement [${idx + 1}] : bouton "Suivant" introuvable.`, 'error');
+          await finishAdherent(flow, adherent, false, 'Bouton "Suivant" introuvable');
         } else {
           await setStatus(`Renouvellement [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
           await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
@@ -882,26 +937,13 @@
           await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
           return;
         }
-        if (r.success) {
-          await new Promise(res => setTimeout(res, 1500));
-          const err = await applyStep('checkError', adherent);
-          if (err && err.hasError) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
-            return;
-          }
-          // Voir le commentaire équivalent côté extension Chrome (background.js) :
-          // un plantage JS synchrone côté FFJDA pendant le clic n'affiche pas
-          // toujours de modale et ne remonte jamais jusqu'ici — seule
-          // l'absence de navigation le trahit.
-          if (location.href === startUrl) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
-            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
-            return;
-          }
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
-          apiMarkSaisie(adherent);
-          await finishAdherent(flow, adherent, true, null, 2500);
+        if (r.success && r.readyForManualClick) {
+          flow.awaitingManualSubmit = { fromUrl: startUrl };
+          await storeSet('flow', flow);
+          await waitForManualSubmitLocal(flow, adherent, idx, total, startUrl);
+        } else if (r.success) {
+          await setStatus(`Étape 2 [${idx + 1}] : bouton "Suivant" introuvable.`, 'error');
+          await finishAdherent(flow, adherent, false, 'Bouton "Suivant" introuvable');
         } else {
           await setStatus(`Étape 2 [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
           await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
