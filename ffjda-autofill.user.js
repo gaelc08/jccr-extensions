@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.4
+// @version      1.3.5
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -290,18 +290,29 @@
       // Ré-appliqué avant "Suivant" : remplir le CP/l'adresse (select2)
       // déclenche un recalcul FFJDA qui remet la souscription sur "Non".
       function ensureIAC() {
+        // IDEMPOTENT : ne dispatche input/change que si l'état doit vraiment
+        // changer. ensureIAC() est appelée jusqu'à 3 fois dans ce flux
+        // (avant l'adresse, après — le recalcul FFJDA la remet sur "Non" —,
+        // et une dernière vérification). La redéclencher SANS CONDITION à
+        // chaque appel, même quand "Oui" était déjà correctement sélectionné,
+        // fait boucler indéfiniment un handler jQuery du site FFJDA lui-même
+        // ("Uncaught RangeError: Maximum call stack size exceeded" dans leur
+        // main.js, au moment de Suivant/submit) — vu en prod sur Nardi/Reniez,
+        // confirmé par un test manuel : recommencer proprement ne plante pas.
         const oui = document.querySelector('input[name="souscription"][value="0"]');
         const non = document.querySelector('input[name="souscription"][value="1"]');
-        if (non) non.checked = false;
         let okRadio = false;
         if (oui) {
-          if (!oui.checked) oui.click();   // clic réel : réveille le handler
-          oui.checked = true;              // puis verrouille l'état
-          const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
-          if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true })); // idempotent sur un radio
-          oui.checked = true;
-          oui.dispatchEvent(new Event('input',  { bubbles: true }));
-          oui.dispatchEvent(new Event('change', { bubbles: true }));
+          if (!oui.checked || (non && non.checked)) {
+            if (non) non.checked = false;
+            if (!oui.checked) oui.click();   // clic réel : réveille le handler
+            oui.checked = true;              // puis verrouille l'état
+            const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
+            if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true })); // idempotent sur un radio
+            oui.checked = true;
+            oui.dispatchEvent(new Event('input',  { bubbles: true }));
+            oui.dispatchEvent(new Event('change', { bubbles: true }));
+          }
           okRadio = oui.checked;
         } else {
           console.log('[JCCR] IAC: radio input[name="souscription"][value="0"] introuvable');
@@ -310,10 +321,12 @@
         let okCase = false;
         const ass = document.querySelector('input[name="assurance"]');
         if (ass) {
-          if (!ass.checked) ass.click();
-          ass.checked = true;
-          ass.dispatchEvent(new Event('input',  { bubbles: true }));
-          ass.dispatchEvent(new Event('change', { bubbles: true }));
+          if (!ass.checked) {
+            ass.click();
+            ass.checked = true;
+            ass.dispatchEvent(new Event('input',  { bubbles: true }));
+            ass.dispatchEvent(new Event('change', { bubbles: true }));
+          }
           okCase = ass.checked;
         } else {
           console.log('[JCCR] IAC: case input[name="assurance"] introuvable');
@@ -483,7 +496,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.4';
+  const SCRIPT_VERSION = '1.3.5';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
