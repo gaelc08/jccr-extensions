@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.6
+// @version      1.3.7
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -446,11 +446,16 @@
       function debugSubmitHandlers(label) {
         try {
           const jq = pageJQuery();
-          const form = document.querySelector('form');
-          if (!jq || !form) { console.log('[JCCR-DEBUG]', label, '— pas de jQuery/form'); return; }
-          const events = jq._data ? jq._data(form, 'events') : (jq(form).data('events'));
-          const n = events && events.submit ? events.submit.length : 0;
-          console.log('[JCCR-DEBUG]', label, '—', n, 'handler(s) submit sur', form.id || form.className || '(form sans id)');
+          if (!jq) { console.log('[JCCR-DEBUG]', label, '— pas de jQuery'); return; }
+          const forms = document.querySelectorAll('form');
+          if (!forms.length) { console.log('[JCCR-DEBUG]', label, '— aucun form'); return; }
+          forms.forEach((form, i) => {
+            const events = jq._data ? jq._data(form, 'events') : (jq(form).data('events'));
+            const n = events && events.submit ? events.submit.length : 0;
+            const clickN = events && events.click ? events.click.length : 0;
+            console.log('[JCCR-DEBUG]', label, `— form#${i}`, form.id || form.className || '(sans id)',
+              '—', n, 'submit,', clickN, 'click');
+          });
         } catch (e) {
           console.log('[JCCR-DEBUG]', label, '— erreur:', e.message);
         }
@@ -520,7 +525,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.6';
+  const SCRIPT_VERSION = '1.3.7';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
