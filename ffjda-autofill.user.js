@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.3.7
+// @version      1.3.8
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -479,10 +479,16 @@
         }
       }
 
-      await wait(400);
+      // Délai généreux avant de soumettre : le champ adresse (select2 AJAX)
+      // déclenche une validation/recalcul FFJDA asynchrone (voir ensureIAC),
+      // et un humain laisse toujours plusieurs secondes s'écouler avant de
+      // cliquer Suivant — contrairement à ce script. Un clic trop rapide
+      // pourrait tomber en plein milieu de ce recalcul et faire boucler le
+      // handler de soumission de FFJDA (main.js). Essai : 3s au lieu de 700ms.
+      await wait(3000);
       restoreBelt(beltSnap);
       ensureIAC();
-      await wait(300);
+      await wait(1000);
       debugSubmitHandlers('JUSTE AVANT clic Suivant');
 
       // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
@@ -525,7 +531,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.3.7';
+  const SCRIPT_VERSION = '1.3.8';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
