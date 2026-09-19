@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.5.0
+// @version      1.6.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -509,7 +509,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.5.0';
+  const SCRIPT_VERSION = '1.6.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -657,7 +657,10 @@
   }
 
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
-    flow.results.push({ nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null });
+    flow.results.push({
+      nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null,
+      fallback: !!adherent._fallbackTried,
+    });
     await storeSet('flow', flow);
     setTimeout(() => { nextInQueue(); }, delay);
   }
@@ -671,13 +674,25 @@
       const results = flow.results;
       const okCount = results.filter(r => r.ok).length;
       const failed  = results.filter(r => !r.ok);
+      // Bascule automatique renouvellement → nouvelle licence (voir noResult
+      // plus bas) : FFJDA n'a pas trouvé de licence à renouveler pour cette
+      // personne, on a donc tenté une création à la place. Si notre propre
+      // détection se trompait (nom mal matché, import FFJDA pas à jour...),
+      // ça crée un doublon de profil que FFJDA accepte parfois sans le
+      // signaler. Toujours mis en avant, succès ou échec, pour qu'un humain
+      // vérifie plutôt que de laisser passer silencieusement dans le succès.
+      const fallbackUsed = results.filter(r => r.fallback);
       let msg = `✅ ${okCount}/${flow.queue.length} licence(s) traitée(s) avec succès.`;
+      if (fallbackUsed.length) {
+        msg += `\n⚠️ ${fallbackUsed.length} basculé(s) en NOUVELLE licence faute de licence trouvée au renouvellement — vérifier qu'il n'existe pas déjà une licence FFJDA pour :\n` +
+          fallbackUsed.map(r => `• ${r.nom} ${r.prenom}`).join('\n');
+      }
       if (failed.length) {
         msg += `\n❌ ${failed.length} échec(s) :\n` +
           failed.map(r => `• ${r.nom} ${r.prenom} — ${r.reason || 'erreur inconnue'}`).join('\n');
       }
       await storeSet('flow', null);
-      await setStatus(msg, failed.length ? 'error' : 'success');
+      await setStatus(msg, (failed.length || fallbackUsed.length) ? 'error' : 'success');
       return;
     }
 
@@ -815,13 +830,31 @@
           await new Promise(res => setTimeout(res, 1500));
           const err = await applyStep('checkError', adherent);
           if (err && err.hasError) {
+            // "Licence déjà dans le panier du club" : l'objectif (licence en
+            // file d'attente pour ce club) est déjà atteint — souvent parce
+            // qu'une tentative précédente a réussi mais a été signalée à
+            // tort en échec (voir plus bas). Ce n'est pas un échec.
+            if (/d[ée]j[àa]\s+dans\s+le\s+panier/i.test(err.errorText)) {
+              await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà dans le panier FFJDA, rien à faire.`, 'success');
+              apiMarkSaisie(adherent);
+              await finishAdherent(flow, adherent, true, 'Déjà dans le panier FFJDA (aucune action nécessaire)', 2500);
+              return;
+            }
             await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
             await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
             return;
           }
           if (location.href === startUrl) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
-            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
+            // Observé en prod (lot du 19/09/2026) : FFJDA valide parfois SANS
+            // naviguer ni afficher d'erreur — 4 cas de cette forme se sont
+            // tous avérés être de VRAIS succès une fois vérifiés dans le
+            // panier. On ne peut donc plus le traiter comme un échec par
+            // défaut : compté en succès, avec un avertissement à vérifier
+            // plutôt qu'un échec alarmant qui pousserait à ressaisir (et
+            // créer un doublon).
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée, succès probable (à vérifier dans le panier).`, 'success');
+            apiMarkSaisie(adherent);
+            await finishAdherent(flow, adherent, true, 'Page inchangée après soumission — succès probable, à vérifier dans le panier FFJDA', 2500);
             return;
           }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
@@ -894,13 +927,24 @@
           await new Promise(res => setTimeout(res, 1500));
           const err = await applyStep('checkError', adherent);
           if (err && err.hasError) {
+            // Voir le même cas dans le bloc renouvellement plus haut.
+            if (/d[ée]j[àa]\s+dans\s+le\s+panier/i.test(err.errorText)) {
+              await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà dans le panier FFJDA, rien à faire.`, 'success');
+              apiMarkSaisie(adherent);
+              await finishAdherent(flow, adherent, true, 'Déjà dans le panier FFJDA (aucune action nécessaire)', 2500);
+              return;
+            }
             await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
             await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
             return;
           }
           if (location.href === startUrl) {
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée après soumission (échec silencieux FFJDA ?).`, 'error');
-            await finishAdherent(flow, adherent, false, 'Aucune navigation après soumission — probable plantage JS côté FFJDA', 3000);
+            // Voir le même cas dans le bloc renouvellement plus haut (4/4
+            // vrais succès observés en prod pour cette combinaison "pas
+            // d'erreur, pas de navigation").
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée, succès probable (à vérifier dans le panier).`, 'success');
+            apiMarkSaisie(adherent);
+            await finishAdherent(flow, adherent, true, 'Page inchangée après soumission — succès probable, à vérifier dans le panier FFJDA', 2500);
             return;
           }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
@@ -941,6 +985,18 @@
       || !!a.had_licence_any_season;
   }
 
+  // Garde-fou d'affichage, INDÉPENDANT de hasLicenceFFJDA() : `previous_licence`
+  // et `had_licence_any_season` viennent normalement du même calcul et
+  // devraient toujours concorder, mais un cas réel (Raphaël CANTARERO,
+  // 19/09/2026) a montré une désynchronisation — probablement l'import FFJDA
+  // "toutes saisons" pas encore à jour au moment du calcul. Si l'un des deux
+  // signale une licence passée et pas l'autre, on avertit fort plutôt que de
+  // laisser filer en "nouvelle licence" (FFJDA peut accepter le doublon sans
+  // le signaler).
+  function hasSuspiciousNewStatus(a) {
+    return !hasLicenceFFJDA(a) && !!a.previous_licence;
+  }
+
   function injectStyle() {
     const style = document.createElement('style');
     style.textContent = `
@@ -979,6 +1035,8 @@
       .jcc-adh-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 12px; }
       .jcc-adh-item:last-child { border-bottom: none; }
       .jcc-adh-item.saisie { opacity: 0.5; }
+      .jcc-adh-item.suspicious { background: rgba(255,80,80,0.12); border-left: 3px solid #ff5252; }
+      .jcc-adh-item.suspicious em { color: #ff9d9d; font-style: normal; font-size: 11px; }
       .jcc-counter { font-size: 11px; color: #a8c8e8; margin-bottom: 6px; text-align: right; line-height: 1.5; }
       .jcc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a8c8e8; margin-bottom: 8px; }
       #jcc-ffjda-progress { height: 5px; background: #0f2233; border-radius: 3px; margin-bottom: 8px; overflow: hidden; }
@@ -1065,13 +1123,16 @@
     listEl.innerHTML = filtered.map(({ a, idx }) => {
       // 🔑 = licence FFJDA connue → renouvellement ; ✨ = pas de licence → création.
       // C'est exactement la règle qui décidera du mode au lancement.
+      const suspicious = hasSuspiciousNewStatus(a);
       const modeBadge = hasLicenceFFJDA(a)
         ? '<span title="Renouvellement">🔑</span>'
-        : '<span title="Nouvelle licence">✨</span>';
+        : (suspicious
+          ? `<span title="Ancienne licence FFJDA ${a.previous_licence} (${a.previous_saison || 'saison antérieure'}) détectée — vérifier avant de traiter en NOUVELLE licence, risque de doublon">⚠️</span>`
+          : '<span title="Nouvelle licence">✨</span>');
       return `
-      <label class="jcc-adh-item${a.saisie_ffjda ? ' saisie' : ''}">
+      <label class="jcc-adh-item${a.saisie_ffjda ? ' saisie' : ''}${suspicious ? ' suspicious' : ''}">
         <input type="checkbox" data-idx="${idx}" ${selected.has(idx) ? 'checked' : ''}>
-        <span>${modeBadge} ${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}</span>
+        <span>${modeBadge} ${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}${suspicious ? ` <em>(ancienne licence ${a.previous_licence} ?)</em>` : ''}</span>
       </label>`;
     }).join('');
     listEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
@@ -1152,8 +1213,10 @@
       await loadAdherents(content);
     });
     searchEl.addEventListener('input', () => renderList(listEl, searchEl.value));
+    // "Tout" n'inclut PAS les cas suspects (voir hasSuspiciousNewStatus) : ils
+    // exigent une vérification manuelle avant saisie, pas une sélection en masse.
     content.querySelector('#jcc-btn-all').addEventListener('click', () => {
-      getFiltered().forEach(({ idx }) => selected.add(idx));
+      getFiltered().filter(({ a }) => !hasSuspiciousNewStatus(a)).forEach(({ idx }) => selected.add(idx));
       renderList(listEl, searchEl.value);
     });
     content.querySelector('#jcc-btn-none').addEventListener('click', () => {
