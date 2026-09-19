@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.7.1
+// @version      1.8.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -548,7 +548,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.7.1';
+  const SCRIPT_VERSION = '1.8.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1030,6 +1030,18 @@
     return !hasLicenceFFJDA(a) && !!a.previous_licence;
   }
 
+  // Doublon d'inscription HelloAsso pour la même personne (même
+  // nom+prénom+date de naissance) — typiquement un remboursement fait hors
+  // HelloAsso (virement, espèces...) qui laisse l'ancienne inscription
+  // visible comme "payée" côté API (aucune trace du remboursement manuel).
+  // Vu en prod : famille Hermans, 19/09/2026 — 3 enfants remboursés puis
+  // réinscrits, chacun apparu deux fois. Sans ce garde-fou, la saisie batch
+  // traite les deux comme deux personnes distinctes et tente de créer une
+  // licence FFJDA pour chacune.
+  function hasDuplicateRegistration(a) {
+    return !!a.duplicate_registration;
+  }
+
   function injectStyle() {
     const style = document.createElement('style');
     style.textContent = `
@@ -1070,6 +1082,8 @@
       .jcc-adh-item.saisie { opacity: 0.5; }
       .jcc-adh-item.suspicious { background: rgba(255,80,80,0.12); border-left: 3px solid #ff5252; }
       .jcc-adh-item.suspicious em { color: #ff9d9d; font-style: normal; font-size: 11px; }
+      .jcc-adh-item.duplicate { background: rgba(226,177,60,0.15); border-left: 3px solid #e2b13c; }
+      .jcc-adh-item.duplicate em { color: #f0c674; font-style: normal; font-size: 11px; }
       .jcc-counter { font-size: 11px; color: #a8c8e8; margin-bottom: 6px; text-align: right; line-height: 1.5; }
       .jcc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a8c8e8; margin-bottom: 8px; }
       #jcc-ffjda-progress { height: 5px; background: #0f2233; border-radius: 3px; margin-bottom: 8px; overflow: hidden; }
@@ -1157,15 +1171,19 @@
       // 🔑 = licence FFJDA connue → renouvellement ; ✨ = pas de licence → création.
       // C'est exactement la règle qui décidera du mode au lancement.
       const suspicious = hasSuspiciousNewStatus(a);
+      const duplicate = hasDuplicateRegistration(a);
       const modeBadge = hasLicenceFFJDA(a)
         ? '<span title="Renouvellement">🔑</span>'
         : (suspicious
           ? `<span title="Ancienne licence FFJDA ${a.previous_licence} (${a.previous_saison || 'saison antérieure'}) détectée — vérifier avant de traiter en NOUVELLE licence, risque de doublon">⚠️</span>`
           : '<span title="Nouvelle licence">✨</span>');
+      const duplicateNote = duplicate
+        ? ` <em title="${a.duplicate_count} inscriptions HelloAsso pour cette personne — souvent un remboursement fait hors HelloAsso. Décochez celle à ne pas traiter.">(🔁 doublon inscription x${a.duplicate_count})</em>`
+        : '';
       return `
-      <label class="jcc-adh-item${a.saisie_ffjda ? ' saisie' : ''}${suspicious ? ' suspicious' : ''}">
+      <label class="jcc-adh-item${a.saisie_ffjda ? ' saisie' : ''}${suspicious ? ' suspicious' : ''}${duplicate ? ' duplicate' : ''}">
         <input type="checkbox" data-idx="${idx}" ${selected.has(idx) ? 'checked' : ''}>
-        <span>${modeBadge} ${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}${suspicious ? ` <em>(ancienne licence ${a.previous_licence} ?)</em>` : ''}</span>
+        <span>${modeBadge} ${a.nom} ${a.prenom}${a.saisie_ffjda ? ' ✓' : ''}${suspicious ? ` <em>(ancienne licence ${a.previous_licence} ?)</em>` : ''}${duplicateNote}</span>
       </label>`;
     }).join('');
     listEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
@@ -1246,10 +1264,11 @@
       await loadAdherents(content);
     });
     searchEl.addEventListener('input', () => renderList(listEl, searchEl.value));
-    // "Tout" n'inclut PAS les cas suspects (voir hasSuspiciousNewStatus) : ils
+    // "Tout" n'inclut PAS les cas suspects (voir hasSuspiciousNewStatus) ni
+    // les doublons d'inscription (voir hasDuplicateRegistration) : ils
     // exigent une vérification manuelle avant saisie, pas une sélection en masse.
     content.querySelector('#jcc-btn-all').addEventListener('click', () => {
-      getFiltered().filter(({ a }) => !hasSuspiciousNewStatus(a)).forEach(({ idx }) => selected.add(idx));
+      getFiltered().filter(({ a }) => !hasSuspiciousNewStatus(a) && !hasDuplicateRegistration(a)).forEach(({ idx }) => selected.add(idx));
       renderList(listEl, searchEl.value);
     });
     content.querySelector('#jcc-btn-none').addEventListener('click', () => {
