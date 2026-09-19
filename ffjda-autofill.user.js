@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.6.1
+// @version      1.7.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -536,7 +536,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.6.1';
+  const SCRIPT_VERSION = '1.7.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -686,7 +686,6 @@
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
     flow.results.push({
       nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null,
-      fallback: !!adherent._fallbackTried,
     });
     await storeSet('flow', flow);
     setTimeout(() => { nextInQueue(); }, delay);
@@ -701,25 +700,13 @@
       const results = flow.results;
       const okCount = results.filter(r => r.ok).length;
       const failed  = results.filter(r => !r.ok);
-      // Bascule automatique renouvellement → nouvelle licence (voir noResult
-      // plus bas) : FFJDA n'a pas trouvé de licence à renouveler pour cette
-      // personne, on a donc tenté une création à la place. Si notre propre
-      // détection se trompait (nom mal matché, import FFJDA pas à jour...),
-      // ça crée un doublon de profil que FFJDA accepte parfois sans le
-      // signaler. Toujours mis en avant, succès ou échec, pour qu'un humain
-      // vérifie plutôt que de laisser passer silencieusement dans le succès.
-      const fallbackUsed = results.filter(r => r.fallback);
       let msg = `✅ ${okCount}/${flow.queue.length} licence(s) traitée(s) avec succès.`;
-      if (fallbackUsed.length) {
-        msg += `\n⚠️ ${fallbackUsed.length} basculé(s) en NOUVELLE licence faute de licence trouvée au renouvellement — vérifier qu'il n'existe pas déjà une licence FFJDA pour :\n` +
-          fallbackUsed.map(r => `• ${r.nom} ${r.prenom}`).join('\n');
-      }
       if (failed.length) {
         msg += `\n❌ ${failed.length} échec(s) :\n` +
           failed.map(r => `• ${r.nom} ${r.prenom} — ${r.reason || 'erreur inconnue'}`).join('\n');
       }
       await storeSet('flow', null);
-      await setStatus(msg, (failed.length || fallbackUsed.length) ? 'error' : 'success');
+      await setStatus(msg, failed.length ? 'error' : 'success');
       return;
     }
 
@@ -809,18 +796,20 @@
         await applyStep('clickLink', adherent);
         await failIfNoNavigation(flow, adherent, 'Clic sur le nom sans effet (fiche non ouverte)');
       } else if (res.noResult) {
-        // FFJDA ne le/la liste pas parmi les licenciés éligibles au renouvellement
-        // — on retente en création plutôt que d'échouer, une seule fois.
-        if (modeOf(adherent, flow) === 'renouvellement' && !adherent._fallbackTried) {
-          adherent._mode = 'nouvelle';
-          adherent._fallbackTried = true;
-          await storeSet('flow', flow);
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — pas de licence à renouveler, tentative en création...`, 'info');
-          location.href = 'https://moncompte.ffjudo.com/espace-club/prise-licence/saisir-licence';
-          return;
-        }
-        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé (pas de licence active ?).`, 'error');
-        await finishAdherent(flow, adherent, false, 'Non trouvé (pas de licence active FFJDA)', 3000);
+        // On arrive ici UNIQUEMENT quand la réconciliation avait déjà détecté
+        // une licence FFJDA pour cette personne (c'est justement ce qui a mis
+        // le mode à 'renouvellement' au lancement, voir hasLicenceFFJDA()).
+        // Si FFJDA ne la retrouve pas dans sa liste de renouvellement
+        // (licence trop ancienne, jamais validée par la ligue, nom
+        // orthographié différemment...), on ne bascule JAMAIS en création
+        // automatique : FFJDA accepte parfois de créer un second profil sans
+        // le signaler, ce qui a produit un vrai doublon en prod (Raphaël
+        // Cantarero, 19/09/2026). Un humain doit saisir manuellement via
+        // "RENOUVELER UN LICENCIÉ..." (recherche libre, qui propose aussi
+        // les correspondances approximatives) plutôt que de risquer un
+        // doublon.
+        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — non trouvé au renouvellement malgré une licence FFJDA connue.`, 'error');
+        await finishAdherent(flow, adherent, false, 'Non trouvé au renouvellement alors qu\'une licence FFJDA est déjà connue — À SAISIR MANUELLEMENT via "Renouveler un licencié", ne PAS créer de nouvelle licence', 3000);
       } else {
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — timeout recherche.`, 'error');
         await finishAdherent(flow, adherent, false, 'Timeout recherche', 3000);
