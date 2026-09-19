@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.7.0
+// @version      1.7.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -259,8 +259,20 @@
     // ── Recherche d'un licencié à renouveler ─────────────────────────────────
 
     if (action === 'search') {
-      setByName('nom',    adherent.nom);
-      setByName('prenom', adherent.prenom);
+      // Désaccentué SEULEMENT (ni majuscules, ni tirets touchés — pour ne
+      // pas risquer de perturber la recherche sur des noms composés type
+      // "PASQUER-HERMANS", qui fonctionne déjà). Contrairement à la saisie
+      // d'identité (étape 1, où FFJDA doit enregistrer le nom réel), la
+      // recherche de renouvellement tolère mal un nom accentué — une saisie
+      // manuelle "RAPHAEL" (sans tréma) trouve une correspondance
+      // approximative que la même recherche avec "Raphaël" ne trouve pas
+      // (vu en prod, Raphaël Cantarero : recherche automatisée bredouille,
+      // recherche manuelle sans accent réussit).
+      function stripAccents(s) {
+        return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
+      }
+      setByName('nom',    stripAccents(adherent.nom));
+      setByName('prenom', stripAccents(adherent.prenom));
 
       // Laisse au framework le temps d'enregistrer la saisie avant de soumettre.
       await wait(350);
@@ -536,7 +548,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.7.0';
+  const SCRIPT_VERSION = '1.7.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
