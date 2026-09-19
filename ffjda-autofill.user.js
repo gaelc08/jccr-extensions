@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.6.0
+// @version      1.6.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -182,10 +182,37 @@
       return w.jQuery;
     }
 
+    // Quand la recherche de renouvellement ne trouve pas de correspondance
+    // EXACTE (souvent une ancienne licence, plusieurs saisons sans
+    // renouvellement), FFJDA propose parfois une suggestion approximative :
+    // "Nous avons trouvé quelqu'un qui lui ressemble beaucoup... Est-ce
+    // lui ?" avec un bouton "RENOUVELER CE LICENCIÉ" — PAS un lien sur le nom
+    // (que findNameLink() cherche). Sans le détecter, on confond ce cas avec
+    // "aucun résultat" et on bascule à tort en création d'une NOUVELLE
+    // licence, alors que FFJDA a déjà identifié la bonne personne (juste
+    // avec un degré de confiance moindre qu'un match exact) — vu en prod sur
+    // Raphaël Cantarero, confirmé par un test manuel : cliquer ce bouton
+    // renouvelle correctement sa licence existante.
+    function findFuzzyMatchButton() {
+      const btn = Array.from(document.querySelectorAll('a, button'))
+        .find(el => normText(el.textContent).includes('renouveler ce licencie'));
+      if (!btn) return null;
+      // Sécurité minimale : la page doit bien concerner la personne
+      // recherchée avant de cliquer quoi que ce soit à sa place.
+      const nomA = normName(adherent.nom), prenomA = normName(adherent.prenom);
+      const pageText = normName((document.body && document.body.textContent) || '');
+      if (!pageText.includes(nomA) || !pageText.includes(prenomA)) return null;
+      return btn;
+    }
+
     // ── Actions simples ──────────────────────────────────────────────────────
 
     if (action === 'findLink') {
       if (findNameLink()) return { found: true };
+      // Suggestion approximative AVANT le "aucun résultat" : une page "aucun
+      // licencié trouvé (exact)" peut afficher la suggestion juste en
+      // dessous — la traiter en trouvé plutôt qu'en échec.
+      if (findFuzzyMatchButton()) return { found: true, fuzzy: true };
       // FFJDA formule différemment selon le contexte : "Aucun licencié...",
       // "Aucune licence à renouveler", "Aucune licence trouvée"... On vérifie
       // "aucun" + ("licenc" ou "résultat") plutôt qu'une phrase figée, sinon
@@ -199,7 +226,7 @@
     }
 
     if (action === 'clickLink') {
-      const el = findNameLink();
+      const el = findNameLink() || findFuzzyMatchButton();
       if (!el) return false;
       el.click();
       return true;
@@ -509,7 +536,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.6.0';
+  const SCRIPT_VERSION = '1.6.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -771,7 +798,12 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — attente des résultats...`, 'info');
       const res = await pollForResults(adherent);
       if (res.found) {
-        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ouverture fiche...`, 'info');
+        await setStatus(
+          res.fuzzy
+            ? `[${idx + 1}/${total}] ${adherent.nom} — correspondance approximative FFJDA, confirmation...`
+            : `[${idx + 1}/${total}] ${adherent.nom} — ouverture fiche...`,
+          'info'
+        );
         // Clic (et non navigation) : c'est le geste humain, et il fonctionne
         // que le lien porte une vraie URL ou qu'il soit piloté en JS.
         await applyStep('clickLink', adherent);
