@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.2
+// @version      1.9.3
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -674,7 +674,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.2';
+  const SCRIPT_VERSION = '1.9.3';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1299,7 +1299,7 @@
     const missing = [...new Set(list.flatMap(a => a.missing_history || []))];
     return missing.length
       ? `export(s) FFJDA manquant(s) côté serveur : ${missing.join(', ')} — à importer dans l'onglet Licences FFJDA de l'app de gestion`
-      : "historique FFJDA inconnu";
+      : "serveur de synchro pas à jour (il ne dit pas quel export manque)";
   }
 
   function hasDuplicateRegistration(a) {
@@ -1556,18 +1556,19 @@
       const queue = [...selected].sort((a, b) => a - b)
         .map(i => adherents[i])
         .map(a => Object.assign({}, a, { _mode: hasLicenceFFJDA(a) ? 'renouvellement' : 'nouvelle' }));
-      // Garde-fou : une NOUVELLE licence n'est créée que si l'on SAIT que la
-      // personne n'en a jamais eu (exports FFJDA de la saison précédente
-      // importés). Sinon c'est peut-être un renouvellement → doublon FFJDA.
-      const blocked = queue.filter(a => a._mode === 'nouvelle' && a.licence_history_known !== true);
-      const runnable = queue.filter(a => !blocked.includes(a));
-      if (blocked.length) {
-        await setStatus(`⛔ ${blocked.length} nouvelle(s) licence(s) bloquée(s) : ${blockedReason(blocked)} — `
-          + blocked.map(a => `${a.nom} ${a.prenom}`).join(', '), 'error');
-        if (!runnable.length) return;
-        if (!window.confirm(`${blocked.length} nouvelle(s) licence(s) bloquée(s) (${blockedReason(blocked)}).\nLancer quand même les ${runnable.length} autre(s) ?`)) return;
+      // Historique FFJDA incomplet côté serveur : on ne peut pas affirmer que
+      // ces personnes n'ont jamais eu de licence. On demande confirmation ; de
+      // toute façon chaque nouvelle licence est d'abord cherchée sur le site
+      // FFJDA et rien n'est créé si elle y figure.
+      const unsure = queue.filter(a => a._mode === 'nouvelle' && a.licence_history_known !== true);
+      if (unsure.length && !window.confirm(
+        `⚠️ ${unsure.length} nouvelle(s) licence(s) sans historique FFJDA complet côté serveur (${blockedReason(unsure)}) :\n`
+        + unsure.map(a => `• ${a.nom} ${a.prenom}`).join('\n')
+        + `\n\nChacune sera d'abord cherchée sur FFJDA : si elle y existe, rien ne sera créé.\nContinuer ?`)) {
+        await setStatus('Lancement annulé.', 'info');
+        return;
       }
-      await startQueue(runnable);
+      await startQueue(queue);
     });
 
     loadCampaigns(content).then(() => {
