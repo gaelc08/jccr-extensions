@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.1
+// @version      1.9.2
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -674,7 +674,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.1';
+  const SCRIPT_VERSION = '1.9.2';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1291,6 +1291,17 @@
   // réinscrits, chacun apparu deux fois. Sans ce garde-fou, la saisie batch
   // traite les deux comme deux personnes distinctes et tente de créer une
   // licence FFJDA pour chacune.
+  // Pourquoi une nouvelle licence est bloquée (message affiché à l'utilisateur).
+  function blockedReason(list) {
+    if (list.some(a => a.licence_history_known === undefined)) {
+      return "le serveur de synchro ne renvoie pas l'historique FFJDA (serveur pas à jour, ou liste en cache : rechargez la liste)";
+    }
+    const missing = [...new Set(list.flatMap(a => a.missing_history || []))];
+    return missing.length
+      ? `export(s) FFJDA manquant(s) côté serveur : ${missing.join(', ')} — à importer dans l'onglet Licences FFJDA de l'app de gestion`
+      : "historique FFJDA inconnu";
+  }
+
   function hasDuplicateRegistration(a) {
     return !!a.duplicate_registration;
   }
@@ -1551,11 +1562,10 @@
       const blocked = queue.filter(a => a._mode === 'nouvelle' && a.licence_history_known !== true);
       const runnable = queue.filter(a => !blocked.includes(a));
       if (blocked.length) {
-        await setStatus(`⛔ ${blocked.length} nouvelle(s) licence(s) bloquée(s) : historique FFJDA inconnu `
-          + `(importez les exports FFJDA de la saison précédente dans l'app de gestion) — `
+        await setStatus(`⛔ ${blocked.length} nouvelle(s) licence(s) bloquée(s) : ${blockedReason(blocked)} — `
           + blocked.map(a => `${a.nom} ${a.prenom}`).join(', '), 'error');
         if (!runnable.length) return;
-        if (!window.confirm(`${blocked.length} nouvelle(s) licence(s) bloquée(s) (historique FFJDA inconnu).\nLancer quand même les ${runnable.length} autre(s) ?`)) return;
+        if (!window.confirm(`${blocked.length} nouvelle(s) licence(s) bloquée(s) (${blockedReason(blocked)}).\nLancer quand même les ${runnable.length} autre(s) ?`)) return;
       }
       await startQueue(runnable);
     });
