@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.0
+// @version      1.9.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -80,7 +80,7 @@
    *
    * @param {string} action  'search' | 'findLink' | 'clickLink' | 'clickRenew'
    *                         | 'clickCreate' | 'etape1' | 'etape2' | 'checkError'
-   *                         | 'showAddress' | 'addressStatus'
+   *                         | 'showAddress' | 'addressStatus' | 'nameOnPage'
    * @param {object} adherent
    */
   async function applyStep(action, adherent) {
@@ -224,6 +224,17 @@
           return t.includes('aucun') && (t.includes('licenc') || t.includes('résultat') || t.includes('resultat'));
         });
       return { found: false, noResult };
+    }
+
+    // Nom et prénom affichés dans les résultats, mais sans lien de
+    // renouvellement ni suggestion : typiquement une personne DÉJÀ licenciée
+    // pour la saison (rien à renouveler). Sans ce cas, le polling attendait
+    // un lien qui ne viendra jamais.
+    if (action === 'nameOnPage') {
+      const nomA = normName(adherent.nom), prenomA = normName(adherent.prenom);
+      const main = document.querySelector('#resultats_recherche') || document.body;
+      const t = normName((main && main.textContent) || '');
+      return { present: !!nomA && !!prenomA && t.includes(nomA) && t.includes(prenomA) };
     }
 
     if (action === 'clickLink') {
@@ -663,7 +674,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.0';
+  const SCRIPT_VERSION = '1.9.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -774,6 +785,12 @@
         const r = await applyStep('findLink', adherent);
         if (r && r.found)    return r;
         if (r && r.noResult) return { found: false, noResult: true };
+        // Résultats chargés depuis un moment, la personne y figure mais sans
+        // lien : déjà licenciée cette saison, inutile d'attendre le timeout.
+        if (Date.now() - start > 8000) {
+          const n = await applyStep('nameOnPage', adherent);
+          if (n && n.present) return { found: false, listedNoLink: true };
+        }
       } catch (e) {}
     }
     return { found: false, timeout: true };
@@ -1009,7 +1026,7 @@
         // Vérification avant création : la personne est-elle déjà licenciée
         // du club une saison passée ? Si oui on NE crée RIEN (un homonyme est
         // possible, un humain tranche) ; si non, on passe à la création.
-        if (res.found) {
+        if (res.found || res.listedNoLink) {
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — licence existante trouvée sur FFJDA, aucune création.`, 'error');
           await finishAdherent(flow, adherent, false, 'Un licencié de ce nom existe déjà sur FFJDA — renouvellement probable, à vérifier et saisir à la main (rien n\'a été créé)', 3000);
         } else if (res.noResult) {
@@ -1032,6 +1049,9 @@
         // que le lien porte une vraie URL ou qu'il soit piloté en JS.
         await applyStep('clickLink', adherent);
         await failIfNoNavigation(flow, adherent, 'Clic sur le nom sans effet (fiche non ouverte)');
+      } else if (res.listedNoLink) {
+        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà présent sur FFJDA sans renouvellement possible (déjà licencié ?).`, 'error');
+        await finishAdherent(flow, adherent, false, 'Présent dans les résultats FFJDA mais sans lien de renouvellement — probablement déjà licencié cette saison (à vérifier sur FFJDA)', 3000);
       } else if (res.noResult) {
         // On arrive ici UNIQUEMENT quand la réconciliation avait déjà détecté
         // une licence FFJDA pour cette personne (c'est justement ce qui a mis
