@@ -784,6 +784,9 @@
   // côté extension, mais persisté via storeGet/storeSet puisqu'une
   // navigation de page recharge intégralement le script.
   // ================================================================
+  const RENEW_SEARCH_URL = 'https://moncompte.ffjudo.com/espace-club/prise-licence/renouvellement-licencie-club';
+  const NEW_LICENCE_URL  = 'https://moncompte.ffjudo.com/espace-club/prise-licence/saisir-licence';
+
   function modeOf(adherent, flow) {
     return (adherent && adherent._mode) || (flow && flow.mode) || 'nouvelle';
   }
@@ -839,12 +842,8 @@
 
     await storeSet('flow', flow);
     const adherent = flow.queue[flow.current];
-    const mode = modeOf(adherent, flow);
     await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} ${adherent.prenom}...`, 'info');
-    const targetUrl = mode === 'renouvellement'
-      ? 'https://moncompte.ffjudo.com/espace-club/prise-licence/renouvellement-licencie-club'
-      : 'https://moncompte.ffjudo.com/espace-club/prise-licence/saisir-licence';
-    location.href = targetUrl;
+    location.href = RENEW_SEARCH_URL;
   }
 
   async function startQueue(queue) {
@@ -852,16 +851,9 @@
     const flow = { queue, current: 0, results: [] };
     await storeSet('flow', flow);
     await setStatus(`[1/${queue.length}] ${adherent.nom} ${adherent.prenom}...`, 'info');
-    const firstMode = modeOf(adherent, flow);
-    const targetUrl = firstMode === 'renouvellement'
-      ? 'https://moncompte.ffjudo.com/espace-club/prise-licence/renouvellement-licencie-club'
-      : 'https://moncompte.ffjudo.com/espace-club/prise-licence/saisir-licence';
-    const step = detectStep(location.href);
-    if (firstMode !== 'renouvellement' && step && step !== 'depart') {
-      await handleStep(flow);
-    } else {
-      location.href = targetUrl;
-    }
+    // Toujours par la recherche de renouvellement, y compris pour une
+    // nouvelle licence (vérification qu'aucune licence n'existe déjà).
+    location.href = RENEW_SEARCH_URL;
   }
 
   // Adresse HelloAsso différente de celle préremplie par FFJDA (cas du
@@ -999,8 +991,36 @@
           return;
         }
       }
+      if (step === 'renew_search' && modeOf(adherent, flow) === 'nouvelle') {
+        // Vérification avant création : on ne lit les résultats QUE sur la
+        // page de résultats (la page suivante), jamais sur le formulaire.
+        await failIfNoNavigation(flow, adherent, 'Recherche FFJDA sans effet — rien créé');
+        return;
+      }
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — attente des résultats...`, 'info');
-      const res = await pollForResults(adherent);
+      let res = await pollForResults(adherent);
+      if (modeOf(adherent, flow) === 'nouvelle' && res.noResult) {
+        // « Aucun résultat » doit être stable (résultats chargés en asynchrone).
+        await new Promise(r => setTimeout(r, 3000));
+        const again = await applyStep('findLink', adherent);
+        if (!again || again.found || !again.noResult) res = { found: !!(again && again.found) };
+      }
+      if (modeOf(adherent, flow) === 'nouvelle') {
+        // Vérification avant création : la personne est-elle déjà licenciée
+        // du club une saison passée ? Si oui on NE crée RIEN (un homonyme est
+        // possible, un humain tranche) ; si non, on passe à la création.
+        if (res.found) {
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — licence existante trouvée sur FFJDA, aucune création.`, 'error');
+          await finishAdherent(flow, adherent, false, 'Un licencié de ce nom existe déjà sur FFJDA — renouvellement probable, à vérifier et saisir à la main (rien n\'a été créé)', 3000);
+        } else if (res.noResult) {
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — aucune licence existante, création...`, 'info');
+          location.href = NEW_LICENCE_URL;
+        } else {
+          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — timeout vérification.`, 'error');
+          await finishAdherent(flow, adherent, false, 'Vérification FFJDA impossible (timeout) — rien créé', 3000);
+        }
+        return;
+      }
       if (res.found) {
         await setStatus(
           res.fuzzy
@@ -1505,7 +1525,19 @@
       const queue = [...selected].sort((a, b) => a - b)
         .map(i => adherents[i])
         .map(a => Object.assign({}, a, { _mode: hasLicenceFFJDA(a) ? 'renouvellement' : 'nouvelle' }));
-      await startQueue(queue);
+      // Garde-fou : une NOUVELLE licence n'est créée que si l'on SAIT que la
+      // personne n'en a jamais eu (exports FFJDA de la saison précédente
+      // importés). Sinon c'est peut-être un renouvellement → doublon FFJDA.
+      const blocked = queue.filter(a => a._mode === 'nouvelle' && a.licence_history_known !== true);
+      const runnable = queue.filter(a => !blocked.includes(a));
+      if (blocked.length) {
+        await setStatus(`⛔ ${blocked.length} nouvelle(s) licence(s) bloquée(s) : historique FFJDA inconnu `
+          + `(importez les exports FFJDA de la saison précédente dans l'app de gestion) — `
+          + blocked.map(a => `${a.nom} ${a.prenom}`).join(', '), 'error');
+        if (!runnable.length) return;
+        if (!window.confirm(`${blocked.length} nouvelle(s) licence(s) bloquée(s) (historique FFJDA inconnu).\nLancer quand même les ${runnable.length} autre(s) ?`)) return;
+      }
+      await startQueue(runnable);
     });
 
     loadCampaigns(content).then(() => {
