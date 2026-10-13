@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.4
+// @version      1.9.5
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -42,8 +42,8 @@
 // chacune — c'est exactement la duplication qui a fait diverger l'extension et
 // le userscript. Une fonction unique et auto-suffisante les partage en interne.
 //
-// `detectStep` reste à part : elle est pure et n'est jamais injectée (le service
-// worker l'appelle chez lui, le userscript aussi).
+// `detectStep` et `dobFr` restent à part : pures, jamais injectées (le service
+// worker les appelle chez lui, le userscript aussi).
 
 (function (root) {
   'use strict';
@@ -75,16 +75,28 @@
   }
 
   /**
+   * Date de naissance de l'adhérent en JJ/MM/AAAA, pour l'affichage ('' si
+   * absente ou illisible). Accepte l'ISO de l'API ou du JJ/MM/AAAA. Pure.
+   */
+  function dobFr(s) {
+    s = String(s || '').trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+    if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+    return /^\d{2}\/\d{2}\/\d{4}$/.test(s) ? s : '';
+  }
+
+  /**
    * Exécute une action dans la page FFJDA. AUTO-SUFFISANTE : ne référence rien
    * hors de son propre corps (contrainte de sérialisation, voir en-tête).
    *
    * @param {string} action  'search' | 'findLink' | 'clickLink' | 'clickRenew'
    *                         | 'clickCreate' | 'etape1' | 'etape2' | 'checkError'
    *                         | 'showAddress' | 'addressStatus' | 'nameOnPage'
-   *                         | 'formErrors'
+   *                         | 'formErrors' | 'manualHelp' | 'manualStatus'
    * @param {object} adherent
+   * @param {object} [extra]  'manualHelp' : { reason }
    */
-  async function applyStep(action, adherent) {
+  async function applyStep(action, adherent, extra) {
     adherent = adherent || {};
 
     // ── Helpers partagés par toutes les actions ──────────────────────────────
@@ -336,6 +348,40 @@
       const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s);
       return m ? `${m[3]}-${m[2]}-${m[1]}` : '';
     }
+    // Champ VISIBLE qui double l'input `naissance`, s'il y en a un. Sur un
+    // user-agent iPhone/iPad/Android, flatpickr (FFJDA : 4.6.13, d/m/Y) passe
+    // en mode mobile : l'input d'origine devient type="hidden" et un
+    // <input type="date" class="flatpickr-mobile" required>, sans name, est
+    // inséré juste après. C'est lui que l'utilisateur voit et que le
+    // navigateur valide : vu le 13/10/2026, input caché rempli, champ mobile
+    // vide → « Remplissez ce champ », formulaire jamais soumis. altInput :
+    // variante desktop (altInput:true), pas utilisée par FFJDA à ce jour.
+    function dobVisible(el) {
+      if (!el) return null;
+      const fp = el._flatpickr;
+      if (fp && fp.mobileInput) return fp.mobileInput;
+      const sib = el.nextElementSibling;
+      if (sib && sib.classList && sib.classList.contains('flatpickr-mobile')) return sib;
+      if (fp && fp.altInput) return fp.altInput;
+      return null;
+    }
+    function isType(el, t) { return String((el && el.type) || '').toLowerCase() === t; }
+    // Le champ visible porte-t-il la date ? ISO pour un type=date ; un
+    // altInput affiche son altFormat (« 4 octobre 2022 »…) : flatpickr fait foi.
+    function visibleHolds(el, vis, exp) {
+      if (isType(vis, 'date')) return String(vis.value || '').trim() === exp.iso;
+      if (dobAsIso(vis.value) === exp.iso) return true;
+      const fp = el._flatpickr;
+      const d = fp && fp.selectedDates && fp.selectedDates[0];
+      return !!(String(vis.value || '').trim() && d && typeof fp.formatDate === 'function'
+        && fp.formatDate(d, 'Y-m-d') === exp.iso);
+    }
+    // La date tient dans l'input `naissance` (soumis) ET dans le champ visible.
+    function dobHolds(el, exp) {
+      if (dobAsIso(el.value) !== exp.iso) return false;
+      const vis = dobVisible(el);
+      return !vis || visibleHolds(el, vis, exp);
+    }
     // Motif d'échec affiché tel quel par l'extension et le userscript ('' = OK).
     function dobProblem(el, exp) {
       if (!el) return 'Champ « Date de naissance » introuvable sur la page FFJDA';
@@ -343,10 +389,39 @@
         return `Date de naissance absente ou illisible dans les données HelloAsso (« ${adherent.date_naissance || ''} »)`
           + ' — saisissez-la à la main puis VALIDER';
       }
-      if (dobAsIso(el.value) === exp.iso) return '';
-      const v = String(el.value || '').trim();
-      return `Date de naissance non prise en compte par le site FFJDA (${v ? `champ « ${v} » au lieu de ${exp.fr}` : 'champ vide'})`
+      if (dobHolds(el, exp)) return '';
+      const vis = dobVisible(el);
+      const bad = (vis && !visibleHolds(el, vis, exp)) ? vis : el;
+      const what = bad === vis ? 'calendrier' : 'champ';
+      const v = String(bad.value || '').trim();
+      return `Date de naissance non prise en compte par le site FFJDA (${v ? `${what} « ${v} » au lieu de ${exp.fr}` : `${what} vide`})`
         + ' — saisissez-la à la main puis VALIDER';
+    }
+
+    // Éléments ajoutés par nos soins dans la page (ignorés par les relevés d'erreurs).
+    function ours(el) {
+      return !!(el.closest && el.closest('#jcc-ffjda-panel, #jcc-address-box, #jcc-etape1-box'));
+    }
+    // Libellé d'un champ pour un motif d'erreur. Le champ mobile flatpickr n'a
+    // ni name ni label : on prend ceux de l'input qu'il double (juste avant).
+    // Un input caché n'a pas de `labels` : repli sur label[for].
+    function fieldLabel(el) {
+      const src = (el.classList && el.classList.contains('flatpickr-mobile') && el.previousElementSibling) || el;
+      const lbl = (src.labels && src.labels[0])
+        || (src.id && document.querySelector(`label[for="${src.id}"]`)) || null;
+      return String((lbl && lbl.textContent) || (el.getAttribute && el.getAttribute('placeholder'))
+        || src.name || (src.getAttribute && src.getAttribute('name')) || '')
+        .replace(/\s+/g, ' ').replace(/\s*\*\s*$/, '').trim();
+    }
+    // Champs refusés par la validation HTML5 du navigateur, avec son message.
+    function invalidMessages(scope) {
+      const out = [];
+      scope.querySelectorAll('input, select, textarea').forEach((el) => {
+        if (ours(el) || !el.willValidate || !el.validity || el.validity.valid) return;
+        const lbl = fieldLabel(el);
+        out.push(`${lbl ? lbl + ' : ' : ''}${el.validationMessage || 'valeur refusée'}`);
+      });
+      return out;
     }
 
     // Dispatch annulable : `false` = un handler a fait preventDefault (un
@@ -428,34 +503,60 @@
       if (!focused) fire(el, 'blur');
     }
 
-    // Essaie les stratégies dans l'ordre jusqu'à ce que la date TIENNE : relue
-    // ~300 ms après la saisie (sans blur), puis encore après avoir quitté le
-    // champ.
+    // Essaie les stratégies dans l'ordre jusqu'à ce que la date TIENNE dans
+    // l'input `naissance` ET dans le champ visible : relue ~300 ms après la
+    // saisie (sans blur), puis encore après avoir quitté le champ.
     async function fillDob(el, exp) {
-      const isDate = String(el.type || '').toLowerCase() === 'date';
+      const isDate = isType(el, 'date');
+      // Input caché (flatpickr mobile) : ni focus ni frappe, l'utilisateur ne
+      // le voit pas et le navigateur ne le valide pas.
+      const hidden = isType(el, 'hidden');
       const val = isDate ? exp.iso : exp.fr;
-      const strategies = [
-        ['setter natif',        () => { nativeSet(el, val); fire(el, 'input'); fire(el, 'change'); }],
-        // Passe par un éventuel setter posé sur l'élément par un masque.
-        ['affectation directe', () => { el.value = val; fire(el, 'input'); fire(el, 'change'); }],
-        ['API du widget',       () => widgetSetDate(el, exp, val)],
-        ['frappe clavier',      () => typeText(el, val, isDate)],
-      ];
-      // Masque qui insère les "/" lui-même : on ne tape que les chiffres.
-      if (!isDate) strategies.push(['frappe des chiffres', () => typeText(el, val.replace(/\D/g, ''), false)]);
+      const fp = (el._flatpickr && typeof el._flatpickr.setDate === 'function') ? el._flatpickr : null;
+      const vis = dobVisible(el);
+      const mobile = isType(vis, 'date') ? vis : null;
+      const [y, mo, d] = exp.iso.split('-').map(Number);
+
+      const strategies = [];
+      if (fp || mobile) {
+        // API officielle d'abord (met à jour input ET mobileInput), puis le
+        // champ mobile comme le ferait le sélecteur natif : ISO + input/change,
+        // que flatpickr écoute pour réécrire l'input caché en d/m/Y. Pas de
+        // focus sur le champ mobile : sur iOS il ouvrirait la roue de dates.
+        const name = !mobile ? 'API flatpickr' : (fp ? 'flatpickr (mode mobile)' : 'champ mobile natif');
+        strategies.push([name, () => {
+          let used = false;
+          if (fp) { try { fp.setDate(new Date(y, mo - 1, d), true); used = true; } catch (e) {} }
+          if (mobile) { nativeSet(mobile, exp.iso); fire(mobile, 'input'); fire(mobile, 'change'); used = true; }
+          return used;
+        }]);
+      }
+      if (!hidden) {
+        strategies.push(
+          ['setter natif',        () => { nativeSet(el, val); fire(el, 'input'); fire(el, 'change'); }],
+          // Passe par un éventuel setter posé sur l'élément par un masque.
+          ['affectation directe', () => { el.value = val; fire(el, 'input'); fire(el, 'change'); }],
+          ['API du widget',       () => widgetSetDate(el, exp, val)],
+          ['frappe clavier',      () => typeText(el, val, isDate)],
+        );
+        // Masque qui insère les "/" lui-même : on ne tape que les chiffres.
+        if (!isDate) strategies.push(['frappe des chiffres', () => typeText(el, val.replace(/\D/g, ''), false)]);
+      } else if (!strategies.length) {
+        strategies.push(['setter natif (champ caché)', () => { nativeSet(el, val); fire(el, 'input'); fire(el, 'change'); }]);
+      }
 
       const tried = [];
       for (const [name, run] of strategies) {
-        try { el.focus(); } catch (e) {}
+        if (!hidden) { try { el.focus(); } catch (e) {} }
         let applied;
         try { applied = await run(); } catch (e) { applied = false; }
         if (applied === false) continue;
         tried.push(name);
         await wait(300);
-        if (dobAsIso(el.value) !== exp.iso) continue;
-        leaveField(el);
+        if (!dobHolds(el, exp)) continue;
+        if (!hidden) leaveField(el);
         await wait(300);
-        if (dobAsIso(el.value) === exp.iso) return { ok: true, strategy: name, tried };
+        if (dobHolds(el, exp)) return { ok: true, strategy: name, tried };
       }
       return { ok: false, strategy: null, tried };
     }
@@ -495,14 +596,17 @@
       }
       const dobMsg = dobProblem(dobEl, exp);
       if (dobMsg) {
-        // Page laissée telle quelle, champ date en évidence : l'utilisateur
-        // peut taper la date et valider lui-même.
+        // Page laissée telle quelle, champ date (celui qu'on VOIT) en
+        // évidence : l'utilisateur peut taper la date et valider lui-même.
+        // Pas de focus sur un input caché, ni sur le champ mobile (sur iOS il
+        // ouvrirait la roue de dates sans geste de l'utilisateur).
         res.dobFailed = true;
         res.reason = dobMsg;
-        if (dobEl) {
-          try { dobEl.style.outline = '3px solid #f57c00'; } catch (e) {}
-          try { if (dobEl.scrollIntoView) dobEl.scrollIntoView({ block: 'center' }); } catch (e) {}
-          try { dobEl.focus(); } catch (e) {}
+        const shown = dobVisible(dobEl) || dobEl;
+        if (shown) {
+          try { shown.style.outline = '3px solid #f57c00'; } catch (e) {}
+          try { if (shown.scrollIntoView) shown.scrollIntoView({ block: 'center' }); } catch (e) {}
+          if (!isType(shown, 'hidden') && !isType(shown, 'date')) { try { shown.focus(); } catch (e) {} }
         }
         return res;
       }
@@ -512,10 +616,75 @@
         res.reason = 'Étape 1 : bouton VALIDER introuvable';
         return res;
       }
+      // Validation du navigateur AVANT le clic (checkValidity n'affiche rien) :
+      // un champ requis invalide bloquerait la soumission sans navigation, et
+      // le script ne le verrait qu'au bout de 12 s.
+      const form = (dobEl && dobEl.form) || btn.form || document.querySelector('form');
+      if (form && typeof form.checkValidity === 'function' && !form.checkValidity()) {
+        res.invalid = invalidMessages(form);
+        res.reason = 'Étape 1 : formulaire incomplet, VALIDER non cliqué — '
+          + (res.invalid.join(' | ') || 'champ requis invalide');
+        return res;
+      }
       realClick(btn);
       res.submitted = true;
       res.success = true;
       return res;
+    }
+
+    // ── Étape 1 à finir à la main (extension Chrome) ─────────────────────────
+    // La popup se ferme dès qu'on touche la page : l'encadré montre donc dans
+    // la page ce qu'il faut pour finir (surtout la date de naissance, que
+    // l'utilisateur n'a pas sous la main). Ses boutons notent le choix, lu par
+    // l'orchestrateur via 'manualStatus'. Le userscript affiche la même chose
+    // dans son panneau.
+    if (action === 'manualHelp') {
+      const exp = expectedDob();
+      const old = document.getElementById('jcc-etape1-box');
+      if (old) old.remove();
+      delete document.documentElement.dataset.jccEtape1Choice;
+      const box = document.createElement('div');
+      box.id = 'jcc-etape1-box';
+      box.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;'
+        + 'width:min(440px,calc(100vw - 24px));background:#fff8e1;color:#222;border:2px solid #f57c00;'
+        + 'border-radius:10px;padding:12px 14px;font:15px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.25)';
+      const esc = (v) => String(v || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      const btnCss = 'padding:8px 12px;border:1px solid #f57c00;border-radius:6px;background:#fff;cursor:pointer;font-size:14px';
+      const reason = (extra && extra.reason) || '';
+      box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
+          <b style="color:#e65100">✋ À finir à la main, puis VALIDER</b>
+          <button type="button" data-close style="border:none;background:none;font-size:20px;cursor:pointer">×</button></div>
+        ${reason ? `<div style="margin:4px 0;font-size:13px;color:#555">${esc(reason)}</div>` : ''}
+        <div style="margin:8px 0"><small style="color:#666">Date de naissance</small><br>
+          <b style="font-size:26px;letter-spacing:1px;color:#b71c1c">${esc(exp ? exp.fr : 'absente des données HelloAsso')}</b>
+          ${exp ? `<button type="button" data-copy="${esc(exp.fr)}" style="${btnCss};margin-left:8px">Copier la date</button>` : ''}</div>
+        <div><b>${esc(adherent.nom)}</b> ${esc(adherent.prenom)} — ${adherent.sexe === 'F' ? 'Femme' : 'Homme'}</div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button type="button" data-choice="retry" style="${btnCss};flex:1">↻ Réessayer</button>
+          <button type="button" data-choice="skip" style="${btnCss};flex:1">⏭ Passer cet adhérent</button></div>`;
+      box.addEventListener('click', (e) => {
+        const t = e.target;
+        if (!t || !t.dataset) return;
+        if (t.dataset.copy != null) {
+          const done = (txt) => { t.textContent = txt; setTimeout(() => { t.textContent = 'Copier la date'; }, 1500); };
+          try {
+            navigator.clipboard.writeText(t.dataset.copy).then(() => done('Copié ✓'), () => done('Copie impossible'));
+          } catch (err) { done('Copie impossible'); }
+        } else if (t.dataset.choice) {
+          document.documentElement.dataset.jccEtape1Choice = t.dataset.choice;
+          box.remove();
+        } else if (t.dataset.close != null) {
+          box.remove();
+        }
+      });
+      document.body.appendChild(box);
+      return { shown: true };
+    }
+    // Choix fait dans l'encadré ('retry' | 'skip' | null), consommé à la lecture.
+    if (action === 'manualStatus') {
+      const choice = document.documentElement.dataset.jccEtape1Choice || null;
+      delete document.documentElement.dataset.jccEtape1Choice;
+      return { choice };
     }
 
     // ── Adresse HelloAsso vs adresse préremplie par FFJDA ────────────────────
@@ -843,7 +1012,6 @@
         t = String(t || '').replace(/\s+/g, ' ').trim();
         if (t && t.length <= 300 && !msgs.includes(t)) msgs.push(t);
       };
-      const ours = (el) => !!(el.closest && el.closest('#jcc-ffjda-panel, #jcc-address-box'));
       const shown = (el) => !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
 
       document.querySelectorAll('.invalid-feedback, .alert, .help-block, .text-danger, .error, .form-error, '
@@ -852,14 +1020,7 @@
         if (el.classList && (el.classList.contains('alert-info') || el.classList.contains('alert-success'))) return;
         add(el.textContent);
       });
-      document.querySelectorAll('input, select, textarea').forEach((el) => {
-        if (ours(el) || !el.willValidate || !el.validity || el.validity.valid) return;
-        const lbl = String((el.labels && el.labels[0] && el.labels[0].textContent)
-          || (el.getAttribute && el.getAttribute('placeholder')) || el.name
-          || (el.getAttribute && el.getAttribute('name')) || '')
-          .replace(/\s+/g, ' ').replace(/\s*\*\s*$/, '').trim();
-        add(`${lbl ? lbl + ' : ' : ''}${el.validationMessage || 'valeur refusée'}`);
-      });
+      invalidMessages(document).forEach(add);
       if (typeof getComputedStyle === 'function') {
         const anchor = document.querySelector('[name="naissance"]') || document.querySelector('[name="nom"]');
         const form = (anchor && anchor.form) || document.querySelector('form');
@@ -882,7 +1043,7 @@
     return { error: `Action inconnue : ${action}` };
   }
 
-  root.FfjdaFlow = { detectStep, applyStep };
+  root.FfjdaFlow = { detectStep, applyStep, dobFr };
 })(typeof self !== 'undefined' ? self : this);
 
 
@@ -893,7 +1054,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.4';
+  const SCRIPT_VERSION = '1.9.5';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -990,7 +1151,7 @@
   // detectStep() et applyStep() sont partagés avec l'extension Chrome et
   // concaténés ici au build (scripts/build-userscript.js). Un correctif sur
   // le parcours FFJDA ne s'écrit donc qu'une fois.
-  const { detectStep, applyStep } = (self.FfjdaFlow || {});
+  const { detectStep, applyStep, dobFr } = (self.FfjdaFlow || {});
   if (!detectStep) {
     console.error('[JCCR] lib/ffjda-flow.js absent — script mal construit.');
     return;
@@ -1087,35 +1248,126 @@
     return false;
   }
 
-  // Date de naissance refusée par le champ FFJDA (vu sur iPhone le 13/10/2026) :
-  // applyStep('etape1') n'a PAS cliqué VALIDER et laisse la page telle quelle
-  // (nom, prénom, sexe remplis, champ date en évidence). L'utilisateur tape la
-  // date et clique VALIDER : la page suivante (intermédiaire) reprend la file
-  // via handleStep, exactement comme l'adresse à corriger. Rien n'est marqué
-  // saisi ici : seule l'étape 2 le fait, sur ses propres preuves.
-  async function waitManualDob(flow, adherent, idx, total, reason, expected) {
-    flow.manualDob = { url: location.href };
+  // Étape 1 en échec SANS navigation (date non prise, validation du
+  // navigateur, formulaire refusé, erreur de script) : on ne passe JAMAIS
+  // tout seul à l'adhérent suivant — sur iPhone, le président enchaînait
+  // ainsi des échecs sans pouvoir finir à la main. La file se met en attente,
+  // page laissée remplie, et le panneau affiche ce qu'il faut pour finir
+  // (surtout la date de naissance). VALIDER cliqué à la main : la page
+  // suivante (intermédiaire) reprend la file via handleStep, comme l'adresse
+  // à corriger. Rien n'est marqué saisi ici : seule l'étape 2 le fait.
+  async function waitManualEtape1(flow, adherent, idx, total, reason) {
+    flow.manualEtape1 = { url: location.href };
     await storeSet('flow', flow);
-    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ${adherent.prenom} — ✋ ${reason}`
-      + `${expected ? ` (date attendue : ${expected})` : ''}. La file reprendra ensuite.`, 'error');
-    renderManualDobControls(flow);
+    const dob = dobFr(adherent.date_naissance);
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ${adherent.prenom} — ✋ ${reason}.`
+      + `\nÀ finir à la main${dob ? ` (date de naissance : ${dob})` : ''} puis VALIDER : la file reprendra ensuite.`, 'error');
+    renderManualEtape1Controls(flow);
   }
 
-  function renderManualDobControls(flow) {
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  // navigator.clipboard absent ou refusé (page non sécurisée, ancien iOS) :
+  // repli execCommand, sinon on le dit sans planter.
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(text); return true; }
+    } catch (e) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
+  }
+
+  // Carte « à finir à la main » : données de l'adhérent en clair (la date
+  // n'est pas sous la main de l'utilisateur, qui ne veut pas aller la
+  // chercher sur HelloAsso), + Copier la date / Réessayer / Passer.
+  function renderManualEtape1Controls(flow) {
     const content = document.getElementById('jcc-ffjda-content');
-    if (!content || content.querySelector('#jcc-dob-skip')) return;
-    const wrap = document.createElement('div');
-    wrap.innerHTML = `<button class="jcc-btn secondary" id="jcc-dob-skip">⏭ Passer cet adhérent (rien créé)</button>`;
-    content.prepend(wrap);
+    if (!content) return;
+    const old = content.querySelector('#jcc-e1-manual');
+    if (old) old.remove();
     const adherent = flow.queue[flow.current];
-    wrap.querySelector('#jcc-dob-skip').addEventListener('click', async () => {
-      const cur = await storeGet('flow', null);
-      if (!cur || !cur.manualDob) return;
-      wrap.remove();
-      delete cur.manualDob;
-      await storeSet('flow', cur);
-      await finishAdherent(cur, adherent, false, 'Date de naissance non prise en compte par FFJDA — passé, rien créé', 500);
+    if (!adherent) return;
+    const dob = dobFr(adherent.date_naissance);
+    const wrap = document.createElement('div');
+    wrap.id = 'jcc-e1-manual';
+    wrap.innerHTML = `
+      <div class="jcc-manual">
+        <div class="lbl">Date de naissance</div>
+        <div class="dob">${dob ? esc(dob) : 'absente des données HelloAsso'}</div>
+        <div class="lbl">Nom / Prénom / Sexe</div>
+        <div class="val">${esc(adherent.nom)} ${esc(adherent.prenom)} — ${adherent.sexe === 'F' ? 'Femme' : 'Homme'}</div>
+      </div>
+      ${dob ? '<button class="jcc-btn" id="jcc-e1-copy">📋 Copier la date</button>' : ''}
+      <div class="jcc-btn-row">
+        <button class="jcc-btn" id="jcc-e1-retry">↻ Réessayer</button>
+        <button class="jcc-btn secondary" id="jcc-e1-skip">⏭ Passer cet adhérent</button>
+      </div>`;
+    content.prepend(wrap);
+    // Panneau replié : on le rouvre, c'est là qu'est la date.
+    const body = document.getElementById('jcc-ffjda-body');
+    if (body) body.style.display = '';
+
+    const copyBtn = wrap.querySelector('#jcc-e1-copy');
+    if (copyBtn) copyBtn.addEventListener('click', async () => {
+      const ok = await copyText(dob);
+      copyBtn.textContent = ok ? '✓ Date copiée' : `Copie impossible — ${dob}`;
+      setTimeout(() => { copyBtn.textContent = '📋 Copier la date'; }, 2000);
     });
+    wrap.querySelector('#jcc-e1-retry').addEventListener('click', async () => {
+      const cur = await storeGet('flow', null);
+      if (!cur || !cur.manualEtape1) return;
+      wrap.remove();
+      delete cur.manualEtape1;
+      await storeSet('flow', cur);
+      await runEtape1(cur, cur.queue[cur.current], cur.current, cur.queue.length);
+    });
+    wrap.querySelector('#jcc-e1-skip').addEventListener('click', async () => {
+      const cur = await storeGet('flow', null);
+      if (!cur || !cur.manualEtape1) return;
+      wrap.remove();
+      delete cur.manualEtape1;
+      await storeSet('flow', cur);
+      await setStatus(`${adherent.nom} — passé à la main (étape 1 non validée).`, 'error');
+      await finishAdherent(cur, adherent, false, 'Étape 1 non validée (date de naissance / formulaire) — passé à la main, rien créé', 500);
+    });
+  }
+
+  // Étape 1 nouvelle licence : remplit, VALIDER, et en cas d'échec sans
+  // navigation se met en attente (waitManualEtape1) au lieu d'avancer.
+  async function runEtape1(flow, adherent, idx, total) {
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1...`, 'info');
+    try {
+      // Armé AVANT le clic sur VALIDER : seule une étape 1 lancée pour CET
+      // adhérent autorise la suite de la création (voir creationAllowed).
+      flow.creationFor = idx;
+      await storeSet('flow', flow);
+      const r = await applyStep('etape1', adherent);
+      if (!r || !r.success) {
+        await waitManualEtape1(flow, adherent, idx, total, (r && r.reason) || 'Étape 1 : aucun champ rempli');
+        return;
+      }
+      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1 ✅ → Validation...`, 'info');
+      if (await navigatedWithin(12000)) return;
+      // Pas de navigation : FFJDA a refusé le formulaire. On lit pourquoi
+      // sur la page plutôt que de deviner.
+      let fe = null;
+      try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+      const why = (fe && fe.dobMissing)
+        ? fe.dobReason + (fe.text ? ` — message FFJDA : ${fe.text}` : '')
+        : 'Étape 1 validée sans effet — '
+          + (fe && fe.text ? `FFJDA : ${fe.text}` : 'aucun message d\'erreur visible sur la page');
+      await waitManualEtape1(flow, adherent, idx, total, why);
+    } catch (e) {
+      await waitManualEtape1(flow, adherent, idx, total, 'Erreur étape 1 : ' + e.message);
+    }
   }
 
   async function nextInQueue() {
@@ -1246,17 +1498,18 @@
       const a = flow.queue[flow.current];
       if (a) { await resumeManualAddress(flow, a); return; }
     }
-    if (flow.manualDob) {
-      // En attente de la date tapée à la main (voir waitManualDob).
+    if (flow.manualEtape1) {
+      // En attente de l'étape 1 finie à la main (voir waitManualEtape1).
       const a = flow.queue[flow.current];
       const s = detectStep(location.href);
-      if (!a || !s) return;                       // page hors parcours : on attend
-      delete flow.manualDob;
+      if (!a) return;
+      if (!s) { renderManualEtape1Controls(flow); return; }   // page hors parcours : on attend
+      delete flow.manualEtape1;
       await storeSet('flow', flow);
       if (s !== 'etape1' && s !== 'intermediaire' && s !== 'etape2') {
         // Formulaire quitté sans valider : rien n'a été créé.
-        await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${a.nom} — date de naissance non saisie, formulaire quitté.`, 'error');
-        await finishAdherent(flow, a, false, 'Date de naissance non prise en compte par FFJDA — formulaire quitté sans valider, rien créé', 1500);
+        await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${a.nom} — étape 1 non validée, formulaire quitté.`, 'error');
+        await finishAdherent(flow, a, false, 'Étape 1 non validée (date de naissance / formulaire) — formulaire quitté sans valider, rien créé', 1500);
         return;
       }
       // VALIDER cliqué à la main (intermédiaire) ou formulaire rechargé
@@ -1454,43 +1707,7 @@
     if (step === 'etape1') {
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1...`, 'info');
       await new Promise(r => setTimeout(r, 800));
-      try {
-        // Armé AVANT le clic sur VALIDER : seule une étape 1 lancée pour CET
-        // adhérent autorise la suite de la création (voir creationAllowed).
-        flow.creationFor = idx;
-        await storeSet('flow', flow);
-        const r = await applyStep('etape1', adherent);
-        if (r && r.dobFailed) {
-          await waitManualDob(flow, adherent, idx, total, r.reason, r.dobExpected);
-          return;
-        }
-        if (!r || !r.success) {
-          const why = (r && r.reason) || 'Étape 1 : aucun champ rempli';
-          await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
-          await finishAdherent(flow, adherent, false, why);
-          return;
-        }
-        await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1 ✅ → Validation...`, 'info');
-        if (await navigatedWithin(12000)) return;
-        // Pas de navigation : FFJDA a refusé le formulaire. On lit pourquoi
-        // sur la page plutôt que de deviner.
-        let fe = null;
-        try { fe = await applyStep('formErrors', adherent); } catch (e) {}
-        if (fe && fe.dobMissing) {
-          // Date vidée au moment de la soumission (masque, datepicker) : même
-          // reprise à la main que si elle n'avait jamais tenu.
-          await waitManualDob(flow, adherent, idx, total,
-            fe.dobReason + (fe.text ? ` — message FFJDA : ${fe.text}` : ''), r.dobExpected);
-          return;
-        }
-        const why = 'Étape 1 validée sans effet — '
-          + (fe && fe.text ? `FFJDA : ${fe.text}` : 'aucun message d\'erreur visible sur la page');
-        await setStatus(`${adherent.nom} — ${why}`, 'error');
-        await finishAdherent(flow, adherent, false, why, 1500);
-      } catch (e) {
-        await setStatus('Erreur étape 1 : ' + e.message, 'error');
-        await finishAdherent(flow, adherent, false, 'Erreur étape 1 : ' + e.message);
-      }
+      await runEtape1(flow, adherent, idx, total);
       return;
     }
 
@@ -1681,6 +1898,10 @@
       .jcc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a8c8e8; margin-bottom: 8px; }
       #jcc-ffjda-progress { height: 5px; background: #0f2233; border-radius: 3px; margin-bottom: 8px; overflow: hidden; }
       #jcc-ffjda-progress-fill { height: 100%; background: #1a6fa8; width: 0%; transition: width .3s; }
+      .jcc-manual { background: #fff8e1; color: #222; border: 2px solid #f57c00; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+      .jcc-manual .lbl { font-size: 11px; color: #666; }
+      .jcc-manual .dob { font-size: 28px; font-weight: 800; letter-spacing: 1px; color: #b71c1c; margin-bottom: 4px; user-select: all; -webkit-user-select: all; }
+      .jcc-manual .val { font-size: 16px; font-weight: 700; }
     `;
     document.head.appendChild(style);
   }
