@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.10.0
+// @version      1.10.1
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -1367,7 +1367,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.10.0';
+  const SCRIPT_VERSION = '1.10.1';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1689,16 +1689,7 @@
     flow.current++;
 
     if (flow.current >= flow.queue.length) {
-      const results = flow.results;
-      const okCount = results.filter(r => r.ok).length;
-      const failed  = results.filter(r => !r.ok);
-      let msg = `✅ ${okCount}/${flow.queue.length} licence(s) traitée(s) avec succès.`;
-      if (failed.length) {
-        msg += `\n❌ ${failed.length} échec(s) :\n` +
-          failed.map(r => `• ${r.nom} ${r.prenom} — ${r.reason || 'erreur inconnue'}`).join('\n');
-      }
-      await storeSet('flow', null);
-      await setStatus(msg, failed.length ? 'error' : 'success');
+      await endQueue(flow);
       return;
     }
 
@@ -1708,9 +1699,37 @@
     location.href = RENEW_SEARCH_URL;
   }
 
+  // Fin de file, quel que soit le chemin (dernier adhérent fini, passé,
+  // annulation) : bilan mémorisé (stockage 'bilan', affiché jusqu'à la
+  // prochaine file ou « Effacer ») puis retour à l'écran normal. Avant la
+  // 1.10.1, le panneau restait figé sur « ⏹ Annuler la file » sans liste.
+  async function endQueue(flow, { cancelled = false } = {}) {
+    const results = flow.results || [];
+    const okCount = results.filter(r => r.ok).length;
+    const failed  = results.filter(r => !r.ok);
+    let msg = cancelled
+      ? `⏹ File annulée : ${okCount} licence(s) traitée(s) avec succès sur ${results.length} terminée(s) / ${flow.queue.length}.`
+      : `✅ ${okCount}/${flow.queue.length} licence(s) traitée(s) avec succès.`;
+    if (failed.length) {
+      msg += `\n❌ ${failed.length} échec(s) :\n` +
+        failed.map(r => `• ${r.nom} ${r.prenom} — ${r.reason || 'erreur inconnue'}`).join('\n');
+    }
+    const cur = flow.queue[flow.current];
+    if (cancelled && cur && flow.pendingSubmit) {
+      msg += `\n⚠️ « Suivant » envoyé pour ${cur.nom} ${cur.prenom} sans réponse connue : vérifiez le panier FFJDA.`;
+    }
+    const type = failed.length || (cancelled && flow.pendingSubmit) ? 'error' : (cancelled ? 'info' : 'success');
+    await storeSet('flow', null);
+    await storeSet('bilan', { msg, type, ts: Date.now() });
+    await setStatus(msg, type);
+    await renderIdle();
+  }
+
   async function startQueue(queue) {
     const adherent = queue[0];
     const flow = { queue, current: 0, results: [] };
+    await storeSet('bilan', null);
+    renderBilan(null);
     await storeSet('flow', flow);
     await setStatus(`[1/${queue.length}] ${adherent.nom} ${adherent.prenom}...`, 'info');
     // Toujours par la recherche de renouvellement, y compris pour une
@@ -2329,6 +2348,13 @@
       .jcc-manual .lbl { font-size: 11px; color: #666; }
       .jcc-manual .dob { font-size: 28px; font-weight: 800; letter-spacing: 1px; color: #b71c1c; margin-bottom: 4px; user-select: all; -webkit-user-select: all; }
       .jcc-manual .val { font-size: 16px; font-weight: 700; }
+      #jcc-ffjda-bilan { margin: 0 0 10px; padding: 7px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4; max-height: 160px; overflow-y: auto; }
+      #jcc-ffjda-bilan.info    { background: #103a5c; color: #9fd3ff; }
+      #jcc-ffjda-bilan.success { background: #16401f; color: #8fe3a0; }
+      #jcc-ffjda-bilan.error   { background: #4a1414; color: #ff9d9d; }
+      #jcc-ffjda-bilan .head { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
+      #jcc-ffjda-bilan .msg { white-space: pre-line; }
+      #jcc-bilan-clear { border: 1px solid currentColor; background: none; color: inherit; border-radius: 5px; padding: 1px 7px; font-size: 11px; cursor: pointer; }
     `;
     document.head.appendChild(style);
   }
@@ -2343,6 +2369,7 @@
         <span style="font-size:11px;opacity:.7">v${SCRIPT_VERSION} ▾</span>
       </div>
       <div id="jcc-ffjda-body">
+        <div id="jcc-ffjda-bilan" style="display:none"></div>
         <div id="jcc-ffjda-status"></div>
         <div id="jcc-ffjda-progress"><div id="jcc-ffjda-progress-fill"></div></div>
         <div id="jcc-ffjda-content"></div>
@@ -2366,6 +2393,39 @@
   async function setStatus(msg, type = 'info') {
     await storeSet('status', { msg, type, ts: Date.now() });
     renderStatus(msg, type);
+  }
+
+  // Bilan de la dernière file, hors de #jcc-ffjda-content : le chargement de
+  // la liste réécrit le statut, pas ce bloc.
+  function renderBilan(bilan) {
+    const el = document.getElementById('jcc-ffjda-bilan');
+    if (!el) return;
+    if (!bilan || !bilan.msg) { el.innerHTML = ''; el.style.display = 'none'; return; }
+    const at = new Date(bilan.ts || Date.now());
+    const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+    el.className = bilan.type || 'info';
+    el.style.display = '';
+    el.innerHTML = `
+      <div class="head"><b>Bilan de la dernière file (${hhmm})</b>
+        <button type="button" id="jcc-bilan-clear">Effacer</button></div>
+      <div class="msg"></div>`;
+    el.querySelector('.msg').textContent = bilan.msg;
+    el.querySelector('#jcc-bilan-clear').addEventListener('click', async () => {
+      await storeSet('bilan', null);
+      renderBilan(null);
+    });
+  }
+
+  // Écran normal, sans file active : bilan éventuel + liste des adhérents
+  // RECHARGÉE depuis l'API (les ✓ « saisi » viennent de changer).
+  async function renderIdle() {
+    const content = document.getElementById('jcc-ffjda-content');
+    if (!content) return;
+    renderProgress(0, 0);
+    renderBilan(await storeGet('bilan', null));
+    if (!await storeGet('token', null)) { renderTokenForm(content); return; }
+    adherents = [];
+    renderPicker(content);
   }
 
   function renderProgress(current, total) {
@@ -2616,23 +2676,27 @@
     if (savedStatus) renderStatus(savedStatus.msg, savedStatus.type);
 
     const flow = await storeGet('flow', null);
+    if (flow && flow.current >= flow.queue.length) {
+      // File finie dont le bilan n'a pas été posé (page quittée au mauvais moment).
+      await endQueue(flow);
+      return;
+    }
     if (flow) {
       renderProgress(flow.current, flow.queue.length);
       content.innerHTML = `
         <button class="jcc-btn secondary" id="jcc-cancel-btn">⏹ Annuler la file</button>
       `;
       content.querySelector('#jcc-cancel-btn').addEventListener('click', async () => {
-        await storeSet('flow', null);
-        await setStatus('Flux annulé.', 'info');
-        renderPicker(content);
+        // Relue : la file a pu avancer (ou se terminer) depuis l'affichage.
+        const cur = await storeGet('flow', null);
+        if (cur) await endQueue(cur, { cancelled: true });
+        else await renderIdle();
       });
       await handleStep(flow);
       return;
     }
 
-    const token = await storeGet('token', null);
-    if (!token) { renderTokenForm(content); return; }
-    renderPicker(content);
+    await renderIdle();
   }
 
   if (document.readyState === 'loading') {
