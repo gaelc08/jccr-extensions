@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.3
+// @version      1.9.4
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -81,6 +81,7 @@
    * @param {string} action  'search' | 'findLink' | 'clickLink' | 'clickRenew'
    *                         | 'clickCreate' | 'etape1' | 'etape2' | 'checkError'
    *                         | 'showAddress' | 'addressStatus' | 'nameOnPage'
+   *                         | 'formErrors'
    * @param {object} adherent
    */
   async function applyStep(action, adherent) {
@@ -104,13 +105,16 @@
     // par un framework qui suit sa propre copie de la valeur et ignore une
     // écriture directe — il soumettrait alors un champ vide. Le setter natif
     // du prototype déclenche son tracking, comme une vraie frappe clavier.
-    function setNativeValue(el, val) {
+    function nativeSet(el, val) {
       const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
                   : (el instanceof HTMLSelectElement)   ? HTMLSelectElement.prototype
                   : HTMLInputElement.prototype;
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-      try { el.focus(); } catch (e) {}
       if (desc && desc.set) desc.set.call(el, val); else el.value = val;
+    }
+    function setNativeValue(el, val) {
+      try { el.focus(); } catch (e) {}
+      nativeSet(el, val);
       el.dispatchEvent(new Event('input',  { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('blur',   { bubbles: true }));
@@ -304,45 +308,214 @@
       return Object.assign({ clicked: true, btn: (btn.textContent || btn.value || '').trim() }, state);
     }
 
+    // ── Date de naissance (étape 1 nouvelle licence) ─────────────────────────
+    // Vu en prod le 13/10/2026 sur iPhone (Safari, userscript) : nom, prénom et
+    // sexe remplis, mais le champ date VIDE au moment de « VALIDER » alors que
+    // la relecture juste après la saisie était bonne ; FFJDA refuse sans
+    // naviguer. Tapée à la main, la même date passe. Le DOM réel n'est pas
+    // accessible (site authentifié) : le remplissage doit tenir face à un
+    // <input type="date"> (n'accepte que l'ISO, vide le reste en silence), à un
+    // masque de saisie (tient sa propre copie de la valeur, ignore le setter
+    // natif et vide le champ au blur) ou à un datepicker (jQuery, flatpickr).
+
+    // adherent.date_naissance arrive au format ISO (YYYY-MM-DD, tel que stocké
+    // côté API) ; DD/MM/YYYY accepté aussi. null si absente ou illisible.
+    function expectedDob() {
+      const s = String(adherent.date_naissance || '').trim();
+      let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+      if (m) return { iso: `${m[1]}-${m[2]}-${m[3]}`, fr: `${m[3]}/${m[2]}/${m[1]}` };
+      m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s);
+      if (m) return { iso: `${m[3]}-${m[2]}-${m[1]}`, fr: s };
+      return null;
+    }
+    // Valeur relue dans le champ, ramenée en ISO ('' si ni DD/MM/YYYY ni
+    // YYYY-MM-DD : une date aberrante type "20/09/0925" n'y ressemble pas).
+    function dobAsIso(v) {
+      const s = String(v || '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+      const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s);
+      return m ? `${m[3]}-${m[2]}-${m[1]}` : '';
+    }
+    // Motif d'échec affiché tel quel par l'extension et le userscript ('' = OK).
+    function dobProblem(el, exp) {
+      if (!el) return 'Champ « Date de naissance » introuvable sur la page FFJDA';
+      if (!exp) {
+        return `Date de naissance absente ou illisible dans les données HelloAsso (« ${adherent.date_naissance || ''} »)`
+          + ' — saisissez-la à la main puis VALIDER';
+      }
+      if (dobAsIso(el.value) === exp.iso) return '';
+      const v = String(el.value || '').trim();
+      return `Date de naissance non prise en compte par le site FFJDA (${v ? `champ « ${v} » au lieu de ${exp.fr}` : 'champ vide'})`
+        + ' — saisissez-la à la main puis VALIDER';
+    }
+
+    // Dispatch annulable : `false` = un handler a fait preventDefault (un
+    // masque qui gère lui-même la frappe, typiquement).
+    function fire(el, type, init, Ctor) {
+      const opts = Object.assign({ bubbles: true, cancelable: true }, init || {});
+      let ev;
+      try { ev = new (Ctor || Event)(type, opts); } catch (e) { ev = new Event(type, opts); }
+      return el.dispatchEvent(ev);
+    }
+    function fireKey(el, type, ch) {
+      const K = (typeof KeyboardEvent === 'function') ? KeyboardEvent : Event;
+      const opts = { bubbles: true, cancelable: true, key: ch,
+        code: /\d/.test(ch) ? 'Digit' + ch : (ch === '/' ? 'Slash' : (ch === '-' ? 'Minus' : '')) };
+      let ev;
+      try { ev = new K(type, opts); } catch (e) { ev = new Event(type, opts); }
+      // keyCode/which/charCode valent 0 sur un événement construit ; les
+      // masques jQuery les lisent encore pour savoir quelle touche est tapée.
+      const char = ch.charCodeAt(0);
+      const keyCode = type === 'keypress' ? char : (ch === '/' ? 191 : (ch === '-' ? 189 : char));
+      [['keyCode', keyCode], ['which', keyCode], ['charCode', type === 'keypress' ? char : 0]].forEach(([k, v]) => {
+        try { Object.defineProperty(ev, k, { get: () => v }); } catch (e) {}
+      });
+      return el.dispatchEvent(ev);
+    }
+    // Frappe caractère par caractère, avec l'action par défaut du navigateur
+    // (insertion) seulement si aucun handler ne l'a annulée : un masque qui
+    // gère la touche lui-même écrit alors la valeur à sa façon.
+    async function typeText(el, text, isDate) {
+      const IE = (typeof InputEvent === 'function') ? InputEvent : Event;
+      nativeSet(el, '');
+      fire(el, 'input', { inputType: 'deleteContentBackward' }, IE);
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (fireKey(el, 'keydown', ch) && fireKey(el, 'keypress', ch)
+            && fire(el, 'beforeinput', { inputType: 'insertText', data: ch }, IE)) {
+          // Un <input type="date"> n'accepte qu'une date complète : on lui
+          // pose le préfixe tapé (vidé tant qu'il est incomplet).
+          nativeSet(el, isDate ? text.slice(0, i + 1) : (el.value || '') + ch);
+          fire(el, 'input', { inputType: 'insertText', data: ch }, IE);
+        }
+        fireKey(el, 'keyup', ch);
+        await wait(20);
+      }
+      fire(el, 'change');
+    }
+    // API du widget qui pilote le champ, s'il y en a un. false = aucun.
+    function widgetSetDate(el, exp, val) {
+      const [y, mo, d] = exp.iso.split('-').map(Number);
+      const date = new Date(y, mo - 1, d);
+      let used = false;
+      try {
+        if (el.inputmask && typeof el.inputmask.setValue === 'function') { el.inputmask.setValue(val); used = true; }
+      } catch (e) {}
+      try {
+        if (el._flatpickr && typeof el._flatpickr.setDate === 'function') { el._flatpickr.setDate(date, true); used = true; }
+      } catch (e) {}
+      const jq = pageJQuery();
+      if (jq) {
+        try {
+          // jQuery UI marque le champ (.hasDatepicker) ; bootstrap-datepicker
+          // peut être porté par le conteneur .date / .input-group.
+          const $el = jq(el);
+          const $host = ($el.hasClass('hasDatepicker') || $el.data('datepicker')) ? $el : $el.closest('.date, .input-group');
+          if (typeof $host.datepicker === 'function' && ($host.hasClass('hasDatepicker') || $host.data('datepicker'))) {
+            $host.datepicker('setDate', date);
+            used = true;
+          }
+        } catch (e) {}
+      }
+      if (used) { fire(el, 'input'); fire(el, 'change'); }
+      return used;
+    }
+    // Quitter le champ comme un humain (sur la page, c'est là qu'un masque
+    // ou un datepicker revalide, et vide une valeur qu'il n'a pas vue passer).
+    function leaveField(el) {
+      const focused = document.activeElement === el;
+      try { el.blur(); } catch (e) {}
+      if (!focused) fire(el, 'blur');
+    }
+
+    // Essaie les stratégies dans l'ordre jusqu'à ce que la date TIENNE : relue
+    // ~300 ms après la saisie (sans blur), puis encore après avoir quitté le
+    // champ.
+    async function fillDob(el, exp) {
+      const isDate = String(el.type || '').toLowerCase() === 'date';
+      const val = isDate ? exp.iso : exp.fr;
+      const strategies = [
+        ['setter natif',        () => { nativeSet(el, val); fire(el, 'input'); fire(el, 'change'); }],
+        // Passe par un éventuel setter posé sur l'élément par un masque.
+        ['affectation directe', () => { el.value = val; fire(el, 'input'); fire(el, 'change'); }],
+        ['API du widget',       () => widgetSetDate(el, exp, val)],
+        ['frappe clavier',      () => typeText(el, val, isDate)],
+      ];
+      // Masque qui insère les "/" lui-même : on ne tape que les chiffres.
+      if (!isDate) strategies.push(['frappe des chiffres', () => typeText(el, val.replace(/\D/g, ''), false)]);
+
+      const tried = [];
+      for (const [name, run] of strategies) {
+        try { el.focus(); } catch (e) {}
+        let applied;
+        try { applied = await run(); } catch (e) { applied = false; }
+        if (applied === false) continue;
+        tried.push(name);
+        await wait(300);
+        if (dobAsIso(el.value) !== exp.iso) continue;
+        leaveField(el);
+        await wait(300);
+        if (dobAsIso(el.value) === exp.iso) return { ok: true, strategy: name, tried };
+      }
+      return { ok: false, strategy: null, tried };
+    }
+
     // ── Étape 1 nouvelle licence : identité ──────────────────────────────────
 
     if (action === 'etape1') {
-      // adherent.date_naissance arrive au format ISO (YYYY-MM-DD, tel que
-      // stocké côté API). Le champ FFJDA attend du DD/MM/YYYY — l'y envoyer
-      // tel quel produit une date aberrante (ex. "20/09/0925" vu en prod sur
-      // Nardi) si le champ a un masque de saisie, ce qui a pu contribuer aux
-      // échecs constatés sur les nouvelles licences (jamais reproduits en
-      // renouvellement, qui ne passe pas par ce champ).
-      const isoDob = adherent.date_naissance || '';
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDob);
-      const dob = m ? `${m[3]}/${m[2]}/${m[1]}` : isoDob;
+      // Le champ FFJDA attend du DD/MM/YYYY (ou l'ISO s'il est de type date) :
+      // l'ISO de l'API envoyé tel quel à un masque produisait une date
+      // aberrante ("20/09/0925", vu en prod sur Nardi).
+      const exp = expectedDob();
 
       let f = 0;
-      if (setByName('nom',       adherent.nom))                       f++;
-      if (setByName('prenom',    adherent.prenom))                    f++;
-      if (setByName('sexe',      adherent.sexe === 'F' ? 'F' : 'M')) f++;
-      if (setByName('naissance', dob))                                 f++;
+      if (setByName('nom',    adherent.nom))                       f++;
+      if (setByName('prenom', adherent.prenom))                    f++;
+      if (setByName('sexe',   adherent.sexe === 'F' ? 'F' : 'M')) f++;
+      const dobEl = document.querySelector('[name="naissance"]');
+      let dob = { ok: false, strategy: null, tried: [] };
+      if (dobEl && exp) {
+        dob = await fillDob(dobEl, exp);
+        if (dob.ok) f++;
+      }
 
       await wait(400);
 
+      // Relecture JUSTE AVANT « VALIDER » : un formulaire incomplet n'est pas
+      // soumis. FFJDA le refuserait sans naviguer, et l'échec n'apparaîtrait
+      // qu'après 12 s sous un motif vague.
       const state = {
         nom: readByName('nom'), prenom: readByName('prenom'), naissance: readByName('naissance'),
       };
+      const res = Object.assign({ step: 1, filled: f, submitted: false, success: false,
+        dobExpected: exp ? exp.fr : '', dobStrategy: dob.strategy, dobTried: dob.tried }, state);
+      if (!state.nom || !state.prenom) {
+        res.reason = `Étape 1 : champs non pris en compte (nom="${state.nom || ''}", prénom="${state.prenom || ''}")`;
+        return res;
+      }
+      const dobMsg = dobProblem(dobEl, exp);
+      if (dobMsg) {
+        // Page laissée telle quelle, champ date en évidence : l'utilisateur
+        // peut taper la date et valider lui-même.
+        res.dobFailed = true;
+        res.reason = dobMsg;
+        if (dobEl) {
+          try { dobEl.style.outline = '3px solid #f57c00'; } catch (e) {}
+          try { if (dobEl.scrollIntoView) dobEl.scrollIntoView({ block: 'center' }); } catch (e) {}
+          try { dobEl.focus(); } catch (e) {}
+        }
+        return res;
+      }
       const btn = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
         .find(b => ((b.textContent || b.value || '').trim().toLowerCase()).includes('valider'));
-      if (btn) realClick(btn);
-
-      // Filet de sécurité : si le champ naissance n'a pas la forme
-      // DD/MM/YYYY attendue après saisie (masque de saisie qui a mal
-      // interprété la valeur envoyée, ou tout autre souci), on ne déclare
-      // pas succès — mieux vaut un échec explicite ici qu'une date
-      // aberrante silencieusement soumise plus loin dans le formulaire.
-      const dobOk = !dob || /^\d{2}\/\d{2}\/\d{4}$/.test(state.naissance || '');
-
-      return Object.assign(
-        { step: 1, success: f > 0 && !!state.nom && !!state.prenom && dobOk, filled: f, submitted: !!btn },
-        state
-      );
+      if (!btn) {
+        res.reason = 'Étape 1 : bouton VALIDER introuvable';
+        return res;
+      }
+      realClick(btn);
+      res.submitted = true;
+      res.success = true;
+      return res;
     }
 
     // ── Adresse HelloAsso vs adresse préremplie par FFJDA ────────────────────
@@ -660,6 +833,52 @@
       return { hasError: !!el, errorText: el ? el.textContent.trim().replace(/\s+/g, ' ').slice(0, 300) : '' };
     }
 
+    // Formulaire soumis sans navigation : pourquoi FFJDA l'a-t-il refusé ?
+    // Messages visibles (classes usuelles, texte rouge près des champs) et
+    // validation HTML5 des champs invalides, pour un motif d'échec parlant
+    // au lieu de « formulaire refusé ? ».
+    if (action === 'formErrors') {
+      const msgs = [];
+      const add = (t) => {
+        t = String(t || '').replace(/\s+/g, ' ').trim();
+        if (t && t.length <= 300 && !msgs.includes(t)) msgs.push(t);
+      };
+      const ours = (el) => !!(el.closest && el.closest('#jcc-ffjda-panel, #jcc-address-box'));
+      const shown = (el) => !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+
+      document.querySelectorAll('.invalid-feedback, .alert, .help-block, .text-danger, .error, .form-error, '
+        + '.field-error, .parsley-errors-list, [role="alert"]').forEach((el) => {
+        if (ours(el) || !shown(el)) return;
+        if (el.classList && (el.classList.contains('alert-info') || el.classList.contains('alert-success'))) return;
+        add(el.textContent);
+      });
+      document.querySelectorAll('input, select, textarea').forEach((el) => {
+        if (ours(el) || !el.willValidate || !el.validity || el.validity.valid) return;
+        const lbl = String((el.labels && el.labels[0] && el.labels[0].textContent)
+          || (el.getAttribute && el.getAttribute('placeholder')) || el.name
+          || (el.getAttribute && el.getAttribute('name')) || '')
+          .replace(/\s+/g, ' ').replace(/\s*\*\s*$/, '').trim();
+        add(`${lbl ? lbl + ' : ' : ''}${el.validationMessage || 'valeur refusée'}`);
+      });
+      if (typeof getComputedStyle === 'function') {
+        const anchor = document.querySelector('[name="naissance"]') || document.querySelector('[name="nom"]');
+        const form = (anchor && anchor.form) || document.querySelector('form');
+        if (form) {
+          form.querySelectorAll('span, small, p, div, label, li').forEach((el) => {
+            if (el.children.length || ours(el) || !shown(el)) return;
+            const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(el).color || '');
+            if (m && +m[1] >= 150 && +m[2] <= 90 && +m[3] <= 90) add(el.textContent);
+          });
+        }
+      }
+
+      const dobEl = document.querySelector('[name="naissance"]');
+      const dobReason = dobEl ? dobProblem(dobEl, expectedDob()) : '';
+      const errors = msgs.slice(0, 6);
+      return { errors, text: errors.join(' | '), naissance: dobEl ? dobEl.value : null,
+        dobMissing: !!dobReason, dobReason };
+    }
+
     return { error: `Action inconnue : ${action}` };
   }
 
@@ -674,7 +893,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.3';
+  const SCRIPT_VERSION = '1.9.4';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -819,23 +1038,84 @@
   // rester bloquée indéfiniment sur un message d'attente figé.
   // Si la navigation a bien lieu, ce contexte de script est détruit et la
   // boucle disparaît avec lui — elle n'a donc pas besoin de la détecter.
-  async function failIfNoNavigation(flow, adherent, reason, timeoutMs = 12000) {
+  async function navigatedWithin(timeoutMs) {
     const from = location.href;
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 500));
-      if (location.href !== from) return;   // navigation en cours
+      if (location.href !== from) return true;   // navigation en cours
     }
+    return false;
+  }
+
+  async function failIfNoNavigation(flow, adherent, reason, timeoutMs = 12000) {
+    if (await navigatedWithin(timeoutMs)) return;
     await setStatus(`${adherent.nom} — ${reason}`, 'error');
     await finishAdherent(flow, adherent, false, reason, 1500);
   }
 
   async function finishAdherent(flow, adherent, ok, reason, delay = 2000) {
     flow.results.push({
+      idx: flow.current,
       nom: adherent.nom, prenom: adherent.prenom, mode: modeOf(adherent, flow), ok, reason: reason || null,
     });
+    // Issue déclarée : plus aucune page de création ne doit être traitée pour
+    // cet adhérent (voir creationAllowed).
+    flow.creationFor = null;
     await storeSet('flow', flow);
     setTimeout(() => { nextInQueue(); }, delay);
+  }
+
+  // Une page de création (intermédiaire, étape 2) n'est traitée que si l'étape
+  // 1 a été lancée pour l'adhérent COURANT et qu'aucune issue n'a été déclarée
+  // depuis. Sinon c'est une navigation tardive : étape 1 déclarée en échec au
+  // bout de 12 s alors que FFJDA répondait encore, éventuellement après que la
+  // file soit passée à l'adhérent suivant — on compléterait alors la licence
+  // d'une personne avec les données d'une autre, et on marquerait « saisi »
+  // quelqu'un pour qui rien n'a été créé.
+  async function creationAllowed(flow, adherent, idx, total, page) {
+    if (flow.creationFor === idx) return true;
+    const why = `${page} FFJDA atteinte sans étape 1 en cours pour cet adhérent (navigation tardive) — rien fait, à vérifier sur FFJDA`;
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ${why}`, 'error');
+    if (flow.results.some(r => r.idx === idx)) {
+      // Issue déjà enregistrée : ne pas la compter deux fois, juste avancer
+      // (le passage au suivant programmé par l'ancienne page a disparu avec elle).
+      setTimeout(() => { nextInQueue(); }, 3000);
+    } else {
+      await finishAdherent(flow, adherent, false, why, 3000);
+    }
+    return false;
+  }
+
+  // Date de naissance refusée par le champ FFJDA (vu sur iPhone le 13/10/2026) :
+  // applyStep('etape1') n'a PAS cliqué VALIDER et laisse la page telle quelle
+  // (nom, prénom, sexe remplis, champ date en évidence). L'utilisateur tape la
+  // date et clique VALIDER : la page suivante (intermédiaire) reprend la file
+  // via handleStep, exactement comme l'adresse à corriger. Rien n'est marqué
+  // saisi ici : seule l'étape 2 le fait, sur ses propres preuves.
+  async function waitManualDob(flow, adherent, idx, total, reason, expected) {
+    flow.manualDob = { url: location.href };
+    await storeSet('flow', flow);
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ${adherent.prenom} — ✋ ${reason}`
+      + `${expected ? ` (date attendue : ${expected})` : ''}. La file reprendra ensuite.`, 'error');
+    renderManualDobControls(flow);
+  }
+
+  function renderManualDobControls(flow) {
+    const content = document.getElementById('jcc-ffjda-content');
+    if (!content || content.querySelector('#jcc-dob-skip')) return;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<button class="jcc-btn secondary" id="jcc-dob-skip">⏭ Passer cet adhérent (rien créé)</button>`;
+    content.prepend(wrap);
+    const adherent = flow.queue[flow.current];
+    wrap.querySelector('#jcc-dob-skip').addEventListener('click', async () => {
+      const cur = await storeGet('flow', null);
+      if (!cur || !cur.manualDob) return;
+      wrap.remove();
+      delete cur.manualDob;
+      await storeSet('flow', cur);
+      await finishAdherent(cur, adherent, false, 'Date de naissance non prise en compte par FFJDA — passé, rien créé', 500);
+    });
   }
 
   async function nextInQueue() {
@@ -965,6 +1245,22 @@
     if (flow.manual) {
       const a = flow.queue[flow.current];
       if (a) { await resumeManualAddress(flow, a); return; }
+    }
+    if (flow.manualDob) {
+      // En attente de la date tapée à la main (voir waitManualDob).
+      const a = flow.queue[flow.current];
+      const s = detectStep(location.href);
+      if (!a || !s) return;                       // page hors parcours : on attend
+      delete flow.manualDob;
+      await storeSet('flow', flow);
+      if (s !== 'etape1' && s !== 'intermediaire' && s !== 'etape2') {
+        // Formulaire quitté sans valider : rien n'a été créé.
+        await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${a.nom} — date de naissance non saisie, formulaire quitté.`, 'error');
+        await finishAdherent(flow, a, false, 'Date de naissance non prise en compte par FFJDA — formulaire quitté sans valider, rien créé', 1500);
+        return;
+      }
+      // VALIDER cliqué à la main (intermédiaire) ou formulaire rechargé
+      // (étape 1, nouveau remplissage) : la file reprend normalement.
     }
     const startUrl = location.href;
 
@@ -1159,17 +1455,38 @@
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1...`, 'info');
       await new Promise(r => setTimeout(r, 800));
       try {
+        // Armé AVANT le clic sur VALIDER : seule une étape 1 lancée pour CET
+        // adhérent autorise la suite de la création (voir creationAllowed).
+        flow.creationFor = idx;
+        await storeSet('flow', flow);
         const r = await applyStep('etape1', adherent);
+        if (r && r.dobFailed) {
+          await waitManualDob(flow, adherent, idx, total, r.reason, r.dobExpected);
+          return;
+        }
         if (!r || !r.success) {
-          const why = (r && (!r.nom || !r.prenom))
-            ? `Étape 1 : champs non pris en compte (nom="${(r && r.nom) || ''}", prénom="${(r && r.prenom) || ''}")`
-            : 'Étape 1 : aucun champ rempli';
+          const why = (r && r.reason) || 'Étape 1 : aucun champ rempli';
           await setStatus(`[${idx + 1}/${total}] ${why}.`, 'error');
           await finishAdherent(flow, adherent, false, why);
           return;
         }
         await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 1 ✅ → Validation...`, 'info');
-        await failIfNoNavigation(flow, adherent, 'Étape 1 validée sans effet (formulaire refusé ?)');
+        if (await navigatedWithin(12000)) return;
+        // Pas de navigation : FFJDA a refusé le formulaire. On lit pourquoi
+        // sur la page plutôt que de deviner.
+        let fe = null;
+        try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+        if (fe && fe.dobMissing) {
+          // Date vidée au moment de la soumission (masque, datepicker) : même
+          // reprise à la main que si elle n'avait jamais tenu.
+          await waitManualDob(flow, adherent, idx, total,
+            fe.dobReason + (fe.text ? ` — message FFJDA : ${fe.text}` : ''), r.dobExpected);
+          return;
+        }
+        const why = 'Étape 1 validée sans effet — '
+          + (fe && fe.text ? `FFJDA : ${fe.text}` : 'aucun message d\'erreur visible sur la page');
+        await setStatus(`${adherent.nom} — ${why}`, 'error');
+        await finishAdherent(flow, adherent, false, why, 1500);
       } catch (e) {
         await setStatus('Erreur étape 1 : ' + e.message, 'error');
         await finishAdherent(flow, adherent, false, 'Erreur étape 1 : ' + e.message);
@@ -1178,6 +1495,7 @@
     }
 
     if (step === 'intermediaire') {
+      if (!await creationAllowed(flow, adherent, idx, total, 'Page intermédiaire')) return;
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — création licence...`, 'info');
       await new Promise(r => setTimeout(r, 1000));
       try {
@@ -1196,6 +1514,7 @@
     }
 
     if (step === 'etape2') {
+      if (!await creationAllowed(flow, adherent, idx, total, 'Étape 2')) return;
       await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 2...`, 'info');
       await new Promise(r => setTimeout(r, 1200));
       try {
@@ -1225,12 +1544,22 @@
             return;
           }
           if (location.href === startUrl) {
-            // Voir le même cas dans le bloc renouvellement plus haut (4/4
-            // vrais succès observés en prod pour cette combinaison "pas
-            // d'erreur, pas de navigation").
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée, succès probable (à vérifier dans le panier).`, 'success');
-            apiMarkSaisie(adherent);
-            await finishAdherent(flow, adherent, true, 'Page inchangée après soumission — succès probable, à vérifier dans le panier FFJDA', 2500);
+            // Contrairement au renouvellement (4/4 vrais succès observés pour
+            // "pas d'erreur, pas de navigation"), AUCUNE observation ne
+            // l'établit pour une nouvelle licence, et un formulaire refusé
+            // côté navigateur (champ requis, script FFJDA planté) donne
+            // exactement ce tableau. Marquer « saisi » sans preuve fait
+            // disparaître l'adhérent de la liste « à saisir » (constaté en
+            // prod le 05/10/2026 : un adhérent marqué saisi, aucune licence
+            // créée — chemin exact non établi faute de traces). Non marqué :
+            // au pire il réapparaît, et une relance repasse par la recherche
+            // FFJDA qui empêche toute création si la licence existe déjà.
+            let fe = null;
+            try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+            const why = 'Page inchangée après « Suivant » — NON marqué saisi : vérifier le panier FFJDA'
+              + (fe && fe.text ? ` (FFJDA : ${fe.text})` : '');
+            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ${why}`, 'error');
+            await finishAdherent(flow, adherent, false, why, 2500);
             return;
           }
           await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
