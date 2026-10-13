@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.9.5
+// @version      1.10.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -54,6 +54,9 @@
    */
   function detectStep(url) {
     if (!url) return null;
+    // Page d'arrivée après « Suivant » (étape 2 ou renouvellement) : la seule
+    // preuve qu'une licence est bien partie au panier (voir pendingSubmit).
+    if (/\/modification-panier|\/panier(?:[/?#]|$)/.test(url))              return 'panier';
     // Renouvellement
     if (/\/fiche-licence\/select\//.test(url))                              return 'renew_fiche';
     if (url.includes('/achat-licence/renouvellement-licence-club/etape_1')) return 'renew_form';
@@ -90,11 +93,13 @@
    * hors de son propre corps (contrainte de sérialisation, voir en-tête).
    *
    * @param {string} action  'search' | 'findLink' | 'clickLink' | 'clickRenew'
-   *                         | 'clickCreate' | 'etape1' | 'etape2' | 'checkError'
-   *                         | 'showAddress' | 'addressStatus' | 'nameOnPage'
-   *                         | 'formErrors' | 'manualHelp' | 'manualStatus'
+   *                         | 'clickCreate' | 'etape1' | 'etape2' | 'submitForm'
+   *                         | 'watchSubmit' | 'submitStatus' | 'checkError'
+   *                         | 'showAddress' | 'nameOnPage' | 'formErrors'
+   *                         | 'manualHelp' | 'manualStatus' | 'pauseHelp' | 'pauseStatus'
    * @param {object} adherent
-   * @param {object} [extra]  'manualHelp' : { reason }
+   * @param {object} [extra]  'manualHelp' : { reason } ; 'etape2' : { autoAddress, choices } ;
+   *                          'showAddress' / 'pauseHelp' : { reason, mode|kind, choices }
    */
   async function applyStep(action, adherent, extra) {
     adherent = adherent || {};
@@ -400,7 +405,7 @@
 
     // Éléments ajoutés par nos soins dans la page (ignorés par les relevés d'erreurs).
     function ours(el) {
-      return !!(el.closest && el.closest('#jcc-ffjda-panel, #jcc-address-box, #jcc-etape1-box'));
+      return !!(el.closest && el.closest('#jcc-ffjda-panel, #jcc-address-box, #jcc-etape1-box, #jcc-pause-box'));
     }
     // Libellé d'un champ pour un motif d'erreur. Le champ mobile flatpickr n'a
     // ni name ni label : on prend ceux de l'input qu'il double (juste avant).
@@ -687,7 +692,69 @@
       return { choice };
     }
 
-    // ── Adresse HelloAsso vs adresse préremplie par FFJDA ────────────────────
+    // ── Encadrés dans la page : copie, choix ─────────────────────────────────
+
+    const escHtml = (v) => String(v == null ? '' : v)
+      .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const boxCss = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;'
+      + 'width:min(440px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;background:#fff8e1;'
+      + 'color:#222;border:2px solid #f57c00;border-radius:10px;padding:12px 14px;'
+      + 'font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.25)';
+    const btnCss = 'padding:8px 12px;border:1px solid #f57c00;border-radius:6px;background:#fff;cursor:pointer;font-size:14px';
+
+    // navigator.clipboard absent ou refusé (ancien iOS, page non sécurisée) :
+    // repli execCommand, sinon on le dit sans planter.
+    function copyText(text, done) {
+      const fallback = () => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.setAttribute('readonly', '');
+          ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+          document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+          const ok = document.execCommand('copy');
+          ta.remove();
+          return ok;
+        } catch (e) { return false; }
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => done(true), () => done(fallback()));
+          return;
+        }
+      } catch (e) {}
+      done(fallback());
+    }
+
+    // Boutons d'une pause (extension : la popup se ferme dès qu'on touche la
+    // page, ils vivent donc dans l'encadré). Le choix est noté sur la page et
+    // lu par l'orchestrateur via 'pauseStatus'. Le userscript a les mêmes
+    // boutons dans son panneau et ne les met pas ici.
+    function choicesHtml() {
+      return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">
+          <button type="button" data-choice="done" style="${btnCss};flex:1 1 100%">✓ C'est dans le panier, continuer</button>
+          <button type="button" data-choice="retry" style="${btnCss};flex:1">↻ Réessayer</button>
+          <button type="button" data-choice="skip" style="${btnCss};flex:1">⏭ Passer</button></div>`;
+    }
+    function wireBox(box) {
+      box.addEventListener('click', (e) => {
+        const t = e.target;
+        if (!t || !t.dataset) return;
+        if (t.dataset.copy != null) {
+          const label = t.textContent;
+          copyText(t.dataset.copy, (ok) => {
+            t.textContent = ok ? 'Copié ✓' : 'Copie impossible';
+            setTimeout(() => { t.textContent = label; }, 1500);
+          });
+        } else if (t.dataset.choice) {
+          document.documentElement.dataset.jccPauseChoice = t.dataset.choice;
+          box.remove();
+        } else if (t.dataset.close != null) {
+          box.remove();
+        }
+      });
+    }
+
+    // ── Adresse HelloAsso vs adresse FFJDA ───────────────────────────────────
 
     function selectedText(name) {
       const el = document.querySelector(`[name="${name}"]`);
@@ -720,56 +787,45 @@
       const streetDiff = !!a && !(b && (b.includes(a) || a.includes(b)));
       return { mismatch: cpDiff || streetDiff, ha, ffjda };
     }
-    function showAddressBox(addr) {
+    // Encadré « adresse à saisir » : l'adresse HelloAsso COMPLÈTE, champ par
+    // champ, avec Copier — l'utilisateur ne l'a pas sous la main.
+    // opts : { reason, mode: 'nouvelle' | 'renouvellement', choices }
+    function showAddressBox(addr, opts) {
+      opts = opts || {};
       const old = document.getElementById('jcc-address-box');
       if (old) old.remove();
       const box = document.createElement('div');
       box.id = 'jcc-address-box';
-      box.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;'
-        + 'width:min(440px,calc(100vw - 24px));background:#fff8e1;color:#222;border:2px solid #f57c00;'
-        + 'border-radius:10px;padding:12px 14px;font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.25)';
-      const esc = (v) => String(v || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      box.style.cssText = boxCss;
       const line = (label, value) => value ? `<div style="display:flex;gap:8px;align-items:center;margin:4px 0">
-          <div style="flex:1"><small style="color:#666">${label}</small><br><b>${esc(value)}</b></div>
-          <button type="button" data-copy="${esc(value)}" style="padding:4px 10px;border:1px solid #f57c00;
-            border-radius:6px;background:#fff;cursor:pointer">Copier</button></div>` : '';
-      const cpVille = [addr.ha.code_postal, addr.ha.ville].filter(Boolean).join(' ');
+          <div style="flex:1"><small style="color:#666">${label}</small><br><b>${escHtml(value)}</b></div>
+          <button type="button" data-copy="${escHtml(value)}" style="${btnCss};padding:4px 10px">Copier</button></div>` : '';
+      const intro = opts.mode === 'nouvelle'
+        ? `Adresse non remplie automatiquement${opts.reason ? ` (${escHtml(opts.reason)})` : ''}.
+          Choisissez le <b>code postal</b> puis l'<b>adresse</b> ci-dessous, puis cliquez sur <b>SUIVANT</b>.`
+        : `L'adresse déclarée sur HelloAsso diffère de celle de la licence précédente.
+          Corrigez le <b>code postal</b> puis l'<b>adresse</b> ci-dessous, puis cliquez sur <b>SUIVANT</b>.`;
       box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
-          <b style="color:#e65100">✋ Adresse à mettre à jour</b>
+          <b style="color:#e65100">✋ Adresse à ${opts.mode === 'nouvelle' ? 'saisir' : 'mettre à jour'}</b>
           <button type="button" data-close style="border:none;background:none;font-size:18px;cursor:pointer">×</button></div>
-        <div style="margin:4px 0 8px">L'adresse déclarée sur HelloAsso diffère de celle de la licence précédente.
-          Corrigez le <b>code postal</b> puis l'<b>adresse</b> ci-dessous, puis cliquez sur <b>SUIVANT</b>.</div>
-        ${line('Adresse HelloAsso', addr.ha.adresse)}
-        ${line('Code postal / ville HelloAsso', cpVille)}
+        <div style="margin:4px 0 8px">${intro}</div>
+        <div style="margin-bottom:4px"><b>${escHtml(adherent.nom)}</b> ${escHtml(adherent.prenom)} — adresse HelloAsso :</div>
+        ${line('Rue', addr.ha.adresse)}
+        ${line('Code postal', addr.ha.code_postal)}
+        ${line('Ville', addr.ha.ville)}
+        ${!addr.ha.adresse && !addr.ha.code_postal ? '<div><i>(aucune adresse dans les données HelloAsso)</i></div>' : ''}
         <div style="margin-top:8px;color:#666;font-size:12px">Actuellement sur FFJDA :
-          ${esc([addr.ffjda.adresse, addr.ffjda.cp].filter(Boolean).join(' — ') || '(vide)')}</div>`;
-      box.addEventListener('click', (e) => {
-        const t = e.target;
-        if (t && t.dataset && t.dataset.copy != null) {
-          const done = () => { t.textContent = 'Copié ✓'; setTimeout(() => { t.textContent = 'Copier'; }, 1500); };
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(t.dataset.copy).then(done, () => {});
-          }
-        } else if (t && t.dataset && t.dataset.close != null) {
-          box.remove();
-        }
-      });
+          ${escHtml([addr.ffjda.adresse, addr.ffjda.cp].filter(Boolean).join(' — ') || '(vide)')}</div>
+        ${opts.choices ? choicesHtml() : ''}`;
+      wireBox(box);
       document.body.appendChild(box);
-      // Met en évidence les champs à corriger et note le clic sur SUIVANT
-      // (lu par l'orchestrateur via l'action 'addressStatus').
+      // Met en évidence les champs à corriger.
       ['cp', 'adresse'].forEach((n) => {
         const el = document.querySelector(`[name="${n}"]`);
         const target = (el && el.nextElementSibling && el.nextElementSibling.classList
           && el.nextElementSibling.classList.contains('select2')) ? el.nextElementSibling : el;
         if (target) target.style.outline = '3px solid #f57c00';
       });
-      delete document.documentElement.dataset.jccAddrSubmitted;
-      const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
-        .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-      if (suivant && !suivant.dataset.jccWatched) {
-        suivant.dataset.jccWatched = '1';
-        suivant.addEventListener('click', () => { document.documentElement.dataset.jccAddrSubmitted = '1'; });
-      }
       const cp = document.querySelector('[name="cp"]');
       if (cp && cp.scrollIntoView) cp.scrollIntoView({ block: 'center' });
     }
@@ -778,78 +834,198 @@
     // sans rien remplir ni valider.
     if (action === 'showAddress') {
       const addr = addressCheck();
-      showAddressBox(addr);
+      showAddressBox(addr, extra);
       return { shown: true, mismatch: addr.mismatch };
     }
-    // L'utilisateur a-t-il cliqué SUIVANT après correction ?
-    if (action === 'addressStatus') {
-      return { submitted: document.documentElement.dataset.jccAddrSubmitted === '1' };
+
+    // ── Pause après « Suivant » (extension) ──────────────────────────────────
+    // Issue inconnue : rien n'est marqué « saisi » ni passé sans que
+    // l'utilisateur le dise. extra : { kind, reason }.
+    if (action === 'pauseHelp') {
+      const old = document.getElementById('jcc-pause-box');
+      if (old) old.remove();
+      delete document.documentElement.dataset.jccPauseChoice;
+      const kind = (extra && extra.kind) || '';
+      const title = kind === 'timeout' ? '⏳ Pas de réponse de FFJDA'
+        : kind === 'error' ? '⚠️ FFJDA a réaffiché le formulaire'
+        : kind === 'nosubmit' ? '✋ Formulaire non envoyé'
+        : '✋ En attente';
+      const box = document.createElement('div');
+      box.id = 'jcc-pause-box';
+      box.style.cssText = boxCss;
+      box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
+          <b style="color:#e65100">${title}</b>
+          <button type="button" data-close style="border:none;background:none;font-size:18px;cursor:pointer">×</button></div>
+        <div style="margin:4px 0"><b>${escHtml(adherent.nom)}</b> ${escHtml(adherent.prenom)}</div>
+        ${extra && extra.reason ? `<div style="margin:4px 0;font-size:13px;color:#555">${escHtml(extra.reason)}</div>` : ''}
+        ${choicesHtml()}`;
+      wireBox(box);
+      document.body.appendChild(box);
+      return { shown: true };
     }
+    // Choix fait dans un encadré de pause ('done' | 'retry' | 'skip' | null),
+    // consommé à la lecture.
+    if (action === 'pauseStatus') {
+      const choice = document.documentElement.dataset.jccPauseChoice || null;
+      delete document.documentElement.dataset.jccPauseChoice;
+      return { choice };
+    }
+
+    // ── Envoi du formulaire (« Suivant ») ────────────────────────────────────
+    // Vu en prod le 13/10/2026 : le script décidait 1,5–2,5 s après le clic,
+    // puis naviguait vers l'adhérent suivant pendant que le POST FFJDA (lent)
+    // était encore en vol — la navigation l'annulait, aucune licence au panier
+    // sauf pour le DERNIER de la file, qui ne déclenche aucune navigation. Le
+    // seul signal fiable qu'une requête part est l'événement `submit` du
+    // formulaire, non annulé ; l'issue ne se lit que sur la page suivante.
+
+    function findSuivant() {
+      return Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
+        .find(b => (b.textContent || '').trim().toLowerCase().includes('suivant')) || null;
+    }
+    // Ce qui empêche FFJDA d'envoyer : son disableBtn() (numéro de rue
+    // manquant, vérification d'adresse) et le message affiché sous l'adresse.
+    function submitBlockers(btn) {
+      const out = [];
+      const msg = document.getElementById('message_num-all');
+      const m = msg ? String(msg.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      if (m) out.push(`FFJDA : ${m}`);
+      if (btn && (btn.disabled || (btn.style && btn.style.pointerEvents === 'none'))) {
+        out.push('bouton « Suivant » désactivé par FFJDA');
+      }
+      return out;
+    }
+
+    // Clique « Suivant » et dit si le formulaire est VRAIMENT parti. Le
+    // `submit` est synchrone avec le clic (validation HTML5 → pas d'événement ;
+    // handler FFJDA qui annule → defaultPrevented) : la réponse est donc sûre
+    // dès le retour du clic. L'orchestrateur a noté pendingSubmit AVANT l'appel.
+    if (action === 'submitForm') {
+      const btn = findSuivant();
+      if (!btn) return { clicked: false, submitted: false, reason: 'Bouton « Suivant » introuvable' };
+      const blocked = submitBlockers(btn);
+      if (blocked.length) return { clicked: false, submitted: false, reason: blocked.join(' — ') };
+      let ev = null;
+      const spy = (e) => { if (!ev && !ours(e.target)) ev = e; };
+      document.addEventListener('submit', spy, true);
+      try { btn.click(); } finally { document.removeEventListener('submit', spy, true); }
+      if (!ev) {
+        const form = btn.form || document.querySelector('form');
+        const inv = form ? invalidMessages(form) : [];
+        return { clicked: true, submitted: false,
+          reason: inv.length ? `Formulaire refusé par le navigateur — ${inv.join(' | ')}`
+            : 'Clic sur « Suivant » sans envoi du formulaire' };
+      }
+      if (ev.defaultPrevented) {
+        const b2 = submitBlockers(btn);
+        return { clicked: true, submitted: false, prevented: true,
+          reason: 'Envoi annulé par la page FFJDA' + (b2.length ? ` — ${b2.join(' — ')}` : '') };
+      }
+      return { clicked: true, submitted: true };
+    }
+
+    // « Suivant » cliqué À LA MAIN pendant une pause. Le userscript écoute
+    // lui-même ; le service worker de l'extension ne le peut pas : la page
+    // note l'envoi, relevé par 'submitStatus'.
+    if (action === 'watchSubmit') {
+      const docEl = document.documentElement;
+      if (!docEl.dataset.jccSubmitWatch) {
+        docEl.dataset.jccSubmitWatch = '1';
+        document.addEventListener('submit', (e) => {
+          if (ours(e.target)) return;
+          if (document.querySelector('input[name="souscription"]')) ensureIAC();
+          docEl.dataset.jccSubmitAt = String(Date.now());
+          delete docEl.dataset.jccSubmitPrevented;
+          // defaultPrevented n'est définitif qu'une fois tous les handlers passés.
+          setTimeout(() => { if (e.defaultPrevented) docEl.dataset.jccSubmitPrevented = '1'; }, 0);
+        }, true);
+      }
+      return { watching: true };
+    }
+    // Envoi relevé depuis le dernier appel (consommé à la lecture).
+    if (action === 'submitStatus') {
+      const docEl = document.documentElement;
+      const at = Number(docEl.dataset.jccSubmitAt || 0);
+      if (!at || Date.now() - at < 50) return { submitted: false, prevented: false, at: at || null };
+      const prevented = docEl.dataset.jccSubmitPrevented === '1';
+      delete docEl.dataset.jccSubmitAt;
+      delete docEl.dataset.jccSubmitPrevented;
+      return { submitted: !prevented, prevented, at,
+        reason: prevented ? (submitBlockers(findSuivant()).join(' — ') || 'envoi annulé par la page FFJDA') : '' };
+    }
+
+    // ── Assurance IAC ───────────────────────────────────────────────────────
+
+    // Assurance IAC — TOUJOURS "Oui". Le mapping FFJDA est INVERSÉ :
+    // value="0" = « Oui » (souscrire), value="1" = « Non » (refus, qui OUVRE
+    // un modal Bootstrap). On coche donc value="0" et on désélectionne
+    // value="1" SANS JAMAIS le cliquer, pour ne pas déclencher ce modal.
+    // Ré-appliqué avant "Suivant" : remplir le CP/l'adresse (select2)
+    // déclenche un recalcul FFJDA qui remet la souscription sur "Non".
+    function ensureIAC() {
+      // IDEMPOTENT : ne dispatche input/change que si l'état doit vraiment
+      // changer. ensureIAC() est appelée jusqu'à 3 fois dans ce flux
+      // (avant l'adresse, après — le recalcul FFJDA la remet sur "Non" —,
+      // et une dernière vérification). La redéclencher SANS CONDITION à
+      // chaque appel, même quand "Oui" était déjà correctement sélectionné,
+      // fait boucler indéfiniment un handler jQuery du site FFJDA lui-même
+      // ("Uncaught RangeError: Maximum call stack size exceeded" dans leur
+      // main.js, au moment de Suivant/submit) — vu en prod sur Nardi/Reniez,
+      // confirmé par un test manuel : recommencer proprement ne plante pas.
+      const oui = document.querySelector('input[name="souscription"][value="0"]');
+      const non = document.querySelector('input[name="souscription"][value="1"]');
+      let okRadio = false;
+      if (oui) {
+        if (!oui.checked || (non && non.checked)) {
+          if (non) non.checked = false;
+          if (!oui.checked) oui.click();   // clic réel : réveille le handler
+          oui.checked = true;              // puis verrouille l'état
+          const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
+          if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true })); // idempotent sur un radio
+          oui.checked = true;
+          oui.dispatchEvent(new Event('input',  { bubbles: true }));
+          oui.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        okRadio = oui.checked;
+      } else {
+        console.log('[JCCR] IAC: radio input[name="souscription"][value="0"] introuvable');
+      }
+      // Case "assurance" : pas de clic sur le label, il RE-BASCULERAIT la case.
+      let okCase = false;
+      const ass = document.querySelector('input[name="assurance"]');
+      if (ass) {
+        if (!ass.checked) {
+          ass.click();
+          ass.checked = true;
+          ass.dispatchEvent(new Event('input',  { bubbles: true }));
+          ass.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        okCase = ass.checked;
+      } else {
+        console.log('[JCCR] IAC: case input[name="assurance"] introuvable');
+      }
+      return okRadio || okCase;
+    }
+
+    // Aussi appelée SYNCHRONEMENT pendant l'événement `submit` d'un « Suivant »
+    // cliqué à la main (voir watchSubmit et le userscript) : la saisie
+    // manuelle de l'adresse déclenche le même recalcul FFJDA, et les données
+    // envoyées ne sont lues qu'après ce handler.
+    if (action === 'ensureIAC') return { ok: ensureIAC() };
 
     // ── Étape 2, commune aux nouvelles licences et aux renouvellements ───────
 
     if (action === 'etape2') {
-      // Assurance IAC — TOUJOURS "Oui". Le mapping FFJDA est INVERSÉ :
-      // value="0" = « Oui » (souscrire), value="1" = « Non » (refus, qui OUVRE
-      // un modal Bootstrap). On coche donc value="0" et on désélectionne
-      // value="1" SANS JAMAIS le cliquer, pour ne pas déclencher ce modal.
-      // Ré-appliqué avant "Suivant" : remplir le CP/l'adresse (select2)
-      // déclenche un recalcul FFJDA qui remet la souscription sur "Non".
-      function ensureIAC() {
-        // IDEMPOTENT : ne dispatche input/change que si l'état doit vraiment
-        // changer. ensureIAC() est appelée jusqu'à 3 fois dans ce flux
-        // (avant l'adresse, après — le recalcul FFJDA la remet sur "Non" —,
-        // et une dernière vérification). La redéclencher SANS CONDITION à
-        // chaque appel, même quand "Oui" était déjà correctement sélectionné,
-        // fait boucler indéfiniment un handler jQuery du site FFJDA lui-même
-        // ("Uncaught RangeError: Maximum call stack size exceeded" dans leur
-        // main.js, au moment de Suivant/submit) — vu en prod sur Nardi/Reniez,
-        // confirmé par un test manuel : recommencer proprement ne plante pas.
-        const oui = document.querySelector('input[name="souscription"][value="0"]');
-        const non = document.querySelector('input[name="souscription"][value="1"]');
-        let okRadio = false;
-        if (oui) {
-          if (!oui.checked || (non && non.checked)) {
-            if (non) non.checked = false;
-            if (!oui.checked) oui.click();   // clic réel : réveille le handler
-            oui.checked = true;              // puis verrouille l'état
-            const lbl = oui.id && document.querySelector(`label[for="${oui.id}"]`);
-            if (lbl) lbl.dispatchEvent(new MouseEvent('click', { bubbles: true })); // idempotent sur un radio
-            oui.checked = true;
-            oui.dispatchEvent(new Event('input',  { bubbles: true }));
-            oui.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          okRadio = oui.checked;
-        } else {
-          console.log('[JCCR] IAC: radio input[name="souscription"][value="0"] introuvable');
-        }
-        // Case "assurance" : pas de clic sur le label, il RE-BASCULERAIT la case.
-        let okCase = false;
-        const ass = document.querySelector('input[name="assurance"]');
-        if (ass) {
-          if (!ass.checked) {
-            ass.click();
-            ass.checked = true;
-            ass.dispatchEvent(new Event('input',  { bubbles: true }));
-            ass.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          okCase = ass.checked;
-        } else {
-          console.log('[JCCR] IAC: case input[name="assurance"] introuvable');
-        }
-        return okRadio || okCase;
-      }
-
-      // fillSelect2() (remplissage scripté du CP/adresse via select2) a été
-      // retirée : quelle que soit la variante testée (séquence de clic,
-      // délai avant soumission, choix de l'option en majuscule, clic humain
-      // vs scripté sur "Suivant"...), elle a systématiquement fini par faire
-      // boucler indéfiniment un handler jQuery du site FFJDA lui-même
-      // (main.js:1768). Cause exacte non identifiée après investigation
-      // poussée — un remplissage manuel de bout en bout, lui, n'a jamais
-      // reproduit le crash. Ces deux champs sont donc désormais laissés à
-      // l'utilisateur quand ils diffèrent de HelloAsso (voir addressCheck /
-      // showAddressBox : encadré avec l'adresse HelloAsso, pas de validation auto).
+      // Adresse (nouvelle licence, CP vide) : ni frappe ni ouverture de liste.
+      // L'ancienne simulation select2 (ouvrir, taper, cliquer une option) ne
+      // marchait pas sur iPhone : le userscript y tourne dans un monde JS
+      // isolé où le jQuery de la page est invisible — pageJQuery() rendait
+      // undefined et l'adresse restait vide à chaque fois (13/10/2026). Elle
+      // retombait en outre sur la 1re commune du CP quand la ville HelloAsso
+      // portait un accent (« Beyren-lès-Sierck » → « BASSE RENTGEN »).
+      // Désormais : mêmes requêtes que le widget, puis sélection programmatique
+      // qui déclenche les handlers FFJDA (setDataVille, getCoordonnees) avec
+      // exactement les données qu'il leur passe — voir capAddress.
 
       // Garde ceinture/grade : on n'y touche JAMAIS, mais un autre champ
       // (discipline, adresse…) peut la réinitialiser par effet de bord côté
@@ -899,91 +1075,228 @@
       if (ensureIAC()) f++;
       setCheck('rgpd', true);
 
-      // Champs adresse : select2 alimenté en AJAX, il faut ouvrir, taper, attendre.
-      function fillSelect2(selectName, searchText, targetText) {
-        return new Promise(resolve => {
-          const jq = pageJQuery();
-          if (!jq) { resolve(false); return; }
-          jq('.select2-container--open [name]').each(function () {
-            try { jq(this).select2('close'); } catch (e) {}
-          });
-          const $sel = jq(`[name="${selectName}"]`);
-          if (!$sel.length || !$sel.data('select2')) { resolve(false); return; }
-          setTimeout(() => {
-            $sel.select2('open');
-            setTimeout(() => {
-              const input = document.querySelector('.select2-container--open .select2-search__field');
-              if (!input) { $sel.select2('close'); resolve(false); return; }
-              input.focus(); input.value = searchText;
-              input.dispatchEvent(new Event('input',         { bubbles: true }));
-              input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-              setTimeout(() => {
-                const opts = document.querySelectorAll(
-                  '.select2-container--open .select2-results__option:not(.select2-results__option--disabled):not(.select2-results__option--loading)'
-                );
-                const nt = (targetText || '').toUpperCase().replace(/-/g, ' ');
-                const norm = (s) => (s || '').toUpperCase().replace(/-/g, ' ');
-                const candidates = Array.from(opts).filter(o => norm(o.textContent).includes(nt));
-                // Le premier résultat est souvent un simple écho de la saisie
-                // libre (texte tel que tapé) — la vraie adresse de la base
-                // FFJDA apparaît juste en dessous, en MAJUSCULES. Préférée ici,
-                // même si le vrai coupable des échecs passés était ailleurs
-                // (date de naissance non reformatée, voir etape1).
-                const upper = candidates.find(o => {
-                  const t = o.textContent.trim();
-                  return t.length > 0 && t === t.toUpperCase() && t !== t.toLowerCase();
-                });
-                let match = upper || candidates[0];
-                if (!match && opts[0]) match = opts[0];
-                if (match) { realClick(match); setTimeout(() => resolve(true), 400); }
-                else { $sel.select2('close'); resolve(false); }
-              }, 1500);
-            }, 500);
-          }, 200);
+      // Exécutée dans le monde JS de la PAGE (là où vivent jQuery, select2 et
+      // les handlers FFJDA) : appelée directement si on y est déjà (extension,
+      // monde MAIN), sinon injectée par runInPage. AUTO-SUFFISANTE, donc : elle
+      // est sérialisée par toString(). p : { cp, ville, adresse }.
+      // Reproduit main.js FFJDA : autocompletion_ville (GET ajax/cap-adresse/cp
+      // → {id: postalCode, text: inputOutput, ville: locality, localityid}),
+      // autocompletion_adresse (GET ajax/cap-adresse/street → {id/text:
+      // streetNumber + ' ' + streetName, forced: false}, filtrés sur le CP).
+      const capAddress = async function (p) {
+        const $ = window.jQuery;
+        if (!$ || !$.fn || !$.fn.select2) return { ok: false, reason: 'jQuery / select2 du site FFJDA introuvables' };
+        // `let URL_SITE` dans la page FFJDA : liaison globale, pas window.URL_SITE.
+        const site = (typeof URL_SITE !== 'undefined' && URL_SITE) ? URL_SITE : location.origin + '/';
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const norm = (s) => (' ' + String(s || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+          .replace(/[^A-Z0-9]+/g, ' ') + ' ')
+          .replace(/ (R|RUE) /g, ' RUE ').replace(/ (AV|AVE|AVENUE) /g, ' AVENUE ')
+          .replace(/ (BD|BLD|BOULEVARD) /g, ' BOULEVARD ').replace(/ (IMP|IMPASSE) /g, ' IMPASSE ')
+          .replace(/ (CHE|CHEM|CHEMIN) /g, ' CHEMIN ').replace(/ (PL|PLACE) /g, ' PLACE ')
+          .replace(/ (ALL|ALLEE) /g, ' ALLEE ').replace(/ (RTE|ROUTE) /g, ' ROUTE ')
+          .replace(/ ST /g, ' SAINT ').replace(/ STE /g, ' SAINTE ')
+          .replace(/\s+/g, ' ').trim();
+        const numKey = (s) => String(s == null ? '' : s).toUpperCase().replace(/[^0-9A-Z]/g, '');
+        const list = (d) => {
+          const a = d && d.addresses && d.addresses.address;
+          return Array.isArray(a) ? a : (a ? [a] : []);
+        };
+        // Même transport que le widget ($.ajax de la page : même origine,
+        // cookies de session, X-Requested-With).
+        const get = (path, data) => new Promise((resolve, reject) => {
+          $.ajax({ url: site + path, dataType: 'json', type: 'GET', data })
+            .done(resolve)
+            .fail((x, st) => reject(new Error(`${path} : ${(x && x.status) || st || 'échec'}`)));
+        });
+        // Sélection comme la ferait le widget : option créée si absente (le
+        // CP est la valeur de PLUSIEURS communes : on cible la bonne), valeur,
+        // 'change' (rendu select2), puis 'select2:select' avec les données
+        // qu'attendent les handlers FFJDA.
+        const choose = ($sel, d) => {
+          const el = $sel[0];
+          let opt = Array.from(el.options).find((o) => o.value === d.id && o.text === d.text);
+          if (!opt) { opt = new Option(d.text, d.id, false, false); el.appendChild(opt); }
+          $(opt).data('data', d);
+          $sel.val(d.id);
+          opt.selected = true;
+          $sel.trigger('change');
+          $sel.trigger($.Event('select2:select', { params: { data: d } }));
+        };
+
+        const $cp = $('#cp-selector-all'), $st = $('#street-selector-all');
+        const info = document.getElementById('info-cap-adresse-all');
+        if (!$cp.length || !$st.length || !info) {
+          return { ok: false, reason: 'champs adresse FFJDA introuvables (#cp-selector-all, #street-selector-all)' };
+        }
+
+        // 1. Commune
+        let found;
+        try { found = list(await get('ajax/cap-adresse/cp', { cp: p.cp })); } catch (e) {
+          return { ok: false, reason: `recherche du code postal ${p.cp} sur FFJDA impossible (${e.message})` };
+        }
+        const communes = found
+          .map((i) => ({ id: String(i.postalCode), text: i.inputOutput, ville: i.locality, localityid: i.localityId }))
+          .filter((c) => c.id === p.cp);
+        const v = norm(p.ville);
+        let cp = communes.find((c) => norm(c.ville) === v) || null;
+        if (!cp && v) {
+          const loose = communes.filter((c) => { const n = norm(c.ville); return n && (n.includes(v) || v.includes(n)); });
+          if (loose.length === 1) cp = loose[0];
+        }
+        if (!cp && !v && communes.length === 1) cp = communes[0];
+        if (!cp) {
+          return { ok: false, reason: communes.length
+            ? `commune « ${p.ville} » absente des propositions FFJDA pour ${p.cp} (${communes.map((c) => c.ville).join(', ')})`
+            : `code postal ${p.cp} inconnu de FFJDA` };
+        }
+        choose($cp, { id: cp.id, text: cp.text, ville: cp.ville, localityid: cp.localityid });
+        if (info.dataset.cp !== cp.id || String(info.dataset.localityid) !== String(cp.localityid)) {
+          return { ok: false, cp: cp.text, reason: 'commune non prise en compte par FFJDA (setDataVille)' };
+        }
+
+        // 2. Rue — numéro IDENTIQUE obligatoire.
+        const m = /^\s*(\d+)\s*(BIS|TER|QUATER|[A-Z])?\b[\s,]*(.*)$/i.exec(p.adresse);
+        const wantNum = m ? numKey(m[1] + (m[2] || '')) : '';
+        const wantName = norm(m ? m[3] : p.adresse);
+        try {
+          found = list(await get('ajax/cap-adresse/street', { adresse: p.adresse, localityid: info.dataset.localityid,
+            postalCode: info.dataset.cp, locality: info.dataset.locality }));
+        } catch (e) {
+          return { ok: false, cp: cp.text, reason: `recherche de l'adresse sur FFJDA impossible (${e.message})` };
+        }
+        const streets = found.filter((i) => String(i.postalCode) === cp.id).map((i) => {
+          const n = i.streetNumber == undefined ? '' : i.streetNumber;
+          return { id: n + ' ' + i.streetName, text: n + ' ' + i.streetName, n: numKey(n), name: norm(i.streetName) };
+        });
+        const sameNum = streets.filter((s) => s.n === wantNum);
+        let street = sameNum.find((s) => s.name === wantName) || null;
+        if (!street && wantName) {
+          const loose = sameNum.filter((s) => s.name && (s.name.includes(wantName) || wantName.includes(s.name)));
+          if (loose.length === 1) street = loose[0];
+        }
+        if (!street) {
+          return { ok: false, cp: cp.text, reason: streets.length
+            ? `« ${p.adresse} » ne correspond à aucune adresse FFJDA de même numéro (propositions : ${streets.slice(0, 4).map((s) => s.text.trim()).join(', ')})`
+            : `aucune adresse trouvée par FFJDA pour « ${p.adresse} » à ${cp.ville}` };
+        }
+        choose($st, { id: street.id, text: street.text, forced: false });
+
+        // 3. getCoordonnees (AJAX FFJDA) : attendre les coordonnées, ou son
+        // message « Des numéros sont disponibles… ».
+        const t0 = Date.now();
+        const val = (id) => { const el = document.getElementById(id); return el ? String(el.value || '') : ''; };
+        const msg = () => { const el = document.getElementById('message_num-all'); return el ? el.textContent.trim() : ''; };
+        await sleep(50);
+        while (Date.now() - t0 < 10000) {
+          if (!($.active > 0) && ((val('latitude-all') && val('longitude-all')) || msg())) break;
+          await sleep(100);
+        }
+        return { ok: true, cp: cp.text, street: street.text.trim(),
+          coords: !!(val('latitude-all') && val('longitude-all')), codeinsee: val('codeinsee-all'), waitedMs: Date.now() - t0 };
+      };
+
+      // Exécute `fn(arg)` dans le monde JS de la page par un <script> inséré
+      // (pas de CSP sur moncompte.ffjudo.com) ; résultat rendu via un attribut
+      // du DOM, partagé entre mondes.
+      function runInPage(fn, arg, timeoutMs) {
+        return new Promise((resolve) => {
+          const id = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          const attr = `data-jcc-page-${id}`;
+          const docEl = document.documentElement;
+          const s = document.createElement('script');
+          s.textContent = `(${fn.toString()})(${JSON.stringify(arg)})`
+            + `.then((r) => r, (e) => ({ ok: false, reason: 'erreur : ' + ((e && e.message) || e) }))`
+            + `.then((r) => document.documentElement.setAttribute('${attr}', JSON.stringify(r || {})));`;
+          (document.head || docEl).appendChild(s);
+          s.remove();
+          const t0 = Date.now();
+          (function poll() {
+            const v = docEl.getAttribute(attr);
+            if (v != null) {
+              docEl.removeAttribute(attr);
+              try { resolve(JSON.parse(v)); } catch (e) { resolve({ ok: false, reason: 'réponse illisible du script de page' }); }
+              return;
+            }
+            if (Date.now() - t0 > timeoutMs) {
+              resolve({ ok: false, reason: 'script de page sans réponse (bloqué par le site ?)' });
+              return;
+            }
+            setTimeout(poll, 100);
+          })();
         });
       }
 
+      // Vérification APRÈS coup, dans le DOM (indépendante du monde JS) : ce
+      // que FFJDA enverra réellement.
+      function addressProblems() {
+        const out = [];
+        const ville = document.getElementById('ville-all');
+        const info = document.getElementById('info-cap-adresse-all');
+        const street = document.querySelector('[name="adresse"]');
+        if (!ville || !String(ville.value || '').trim()) out.push('ville FFJDA vide');
+        if (!info || !info.dataset.cp || !info.dataset.localityid) out.push('commune non enregistrée par FFJDA');
+        if (!street || !String(street.value || '').trim()) out.push('adresse FFJDA vide');
+        return out.concat(submitBlockers(findSuivant()));
+      }
+
+      async function autoAddress() {
+        const p = {
+          cp: String(adherent.code_postal || '').replace(/\s/g, ''),
+          ville: String(adherent.ville || '').trim(),
+          adresse: String(adherent.adresse || '').trim(),
+        };
+        if (!/^\d{5}$/.test(p.cp)) return { ok: false, reason: `code postal HelloAsso inutilisable (« ${adherent.code_postal || ''} »)` };
+        if (!p.adresse) return { ok: false, reason: 'adresse absente des données HelloAsso' };
+        // window.jQuery et NON pageJQuery() : il faut savoir si NOTRE monde JS
+        // est celui de la page. Sous un gestionnaire de userscripts (monde
+        // isolé), on passe par un script de page.
+        const w = window;
+        const here = !!(w.jQuery && w.jQuery.fn && w.jQuery.fn.select2);
+        let res;
+        if (here) {
+          try { res = await capAddress(p); } catch (e) { res = { ok: false, reason: `erreur : ${e.message}` }; }
+        } else {
+          res = await runInPage(capAddress, p, 25000);
+        }
+        res = Object.assign({ ok: false, reason: 'pas de réponse' }, res, { via: here ? 'page' : 'script de page' });
+        const problems = addressProblems();
+        if (res.ok && problems.length) Object.assign(res, { ok: false, reason: problems.join(' — ') });
+        return res;
+      }
+
+      const opts = extra || {};
       const cpEl  = document.querySelector('[name="cp"]');
       const hasCP = cpEl && cpEl.value && cpEl.value.trim().length > 0;
-
-      if (!hasCP && adherent.code_postal) {
-        const cpTarget = adherent.ville
-          ? `${adherent.code_postal} ${adherent.ville}`
-          : adherent.code_postal;
-        if (await fillSelect2('cp', adherent.code_postal, cpTarget)) f++;
-        await wait(1200);
-        if (adherent.adresse) {
-          if (await fillSelect2('adresse', adherent.adresse, adherent.adresse)) f++;
-        }
+      let auto = null;
+      // Renouvellement : jamais d'adresse automatique (FFJDA préremplit celle
+      // de la saison passée ; si elle diffère, l'utilisateur tranche).
+      if (opts.autoAddress && !hasCP && (adherent.code_postal || adherent.adresse)) {
+        auto = await autoAddress();
+        if (auto.ok) f++;
       }
 
-      // Renouvellement : FFJDA préremplit l'ADRESSE DE LA SAISON PASSÉE (CP
-      // déjà présent, donc rien n'est rempli ci-dessus). Si elle diffère de
-      // celle déclarée sur HelloAsso, on ne valide PAS à la place de
-      // l'utilisateur : on lui montre l'adresse HelloAsso et il corrige
-      // lui-même (le remplissage scripté du select2 fait planter le site).
-      const addr = addressCheck();
-      if (addr.mismatch) {
-        restoreBelt(beltSnap);
-        ensureIAC();
-        showAddressBox(addr);
-        return { step: 2, success: true, filled: f, submitted: false, needsAddress: true,
-          ffjdaAddress: addr.ffjda, haAddress: addr.ha };
-      }
-
-      await wait(800);
+      await wait(300);
       restoreBelt(beltSnap);
+      // APRÈS l'adresse : le recalcul FFJDA remet la souscription sur « Non ».
       ensureIAC();
-      await wait(400);
 
+      const addr = addressCheck();
+      if ((auto && !auto.ok) || addr.mismatch) {
+        const reason = (auto && !auto.ok) ? auto.reason : 'adresse FFJDA différente de celle déclarée sur HelloAsso';
+        showAddressBox(addr, { reason, mode: auto ? 'nouvelle' : 'renouvellement', choices: !!opts.choices });
+        return { step: 2, success: true, ready: false, filled: f, submitted: false, needsAddress: true,
+          addressReason: reason, autoAddress: auto, ffjdaAddress: addr.ffjda, haAddress: addr.ha };
+      }
+
+      await wait(400);
       // Dernière vérification avant de valider : "Oui" (value=0) bien actif.
       const oui = document.querySelector('input[name="souscription"][value="0"]');
       if (!oui || !oui.checked) ensureIAC();
 
-      const suivant = Array.from(document.querySelectorAll('button.big-btn[type="submit"]'))
-        .find(b => b.textContent.trim().toLowerCase().includes('suivant'));
-      if (suivant) { suivant.click(); f++; }
-      return { step: 2, success: f > 0, filled: f, submitted: !!suivant };
+      // Pas de clic ici : l'orchestrateur note pendingSubmit PUIS appelle
+      // 'submitForm' (une soumission ne doit jamais partir sans trace).
+      return { step: 2, success: true, ready: true, filled: f, submitted: false, autoAddress: auto };
     }
 
     // Après le clic "Suivant" de l'étape 2, FFJDA peut refuser en base (adresse
@@ -1054,7 +1367,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.9.5';
+  const SCRIPT_VERSION = '1.10.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1405,98 +1718,320 @@
     location.href = RENEW_SEARCH_URL;
   }
 
-  // Adresse HelloAsso différente de celle préremplie par FFJDA (cas du
-  // renouvellement) : applyStep('etape2') n'a PAS validé et affiche l'adresse
-  // HelloAsso dans la page. On attend que l'utilisateur corrige et clique
-  // SUIVANT lui-même. Si SUIVANT recharge la page, ce contexte disparaît et
-  // resumeManualAddress() (au chargement suivant) prend le relais.
-  async function waitManualAddress(flow, adherent, startUrl, idx, total) {
-    flow.manual = { url: startUrl, item_id: adherent.item_id || null };
-    await storeSet('flow', flow);
-    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ✋ adresse à corriger sur la page, puis cliquez SUIVANT. La file reprendra ensuite.`, 'info');
-    renderManualControls(flow);
-    for (;;) {
-      await new Promise(r => setTimeout(r, 1000));
-      const cur = await storeGet('flow', null);
-      if (!cur || !cur.manual) return;               // annulé / passé à la main
-      if (location.href !== startUrl) return;         // navigation : la page suivante reprend
-      const st = await applyStep('addressStatus', adherent);
-      if (st && st.submitted) {
-        await new Promise(r => setTimeout(r, 2500));
-        if (location.href !== startUrl) return;
-        const err = await applyStep('checkError', adherent);
-        if (err && err.hasError) {
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}. Corrigez puis cliquez à nouveau SUIVANT.`, 'error');
-          await applyStep('showAddress', adherent);
-          continue;
-        }
-        await completeManualAddress(cur, adherent, 'Adresse corrigée à la main — page inchangée, à vérifier dans le panier FFJDA');
-        return;
-      }
-    }
+  // ================================================================
+  // « Suivant » (étape 2 / renouvellement) : ne JAMAIS perdre un envoi
+  // ================================================================
+  // Incident du 13/10/2026 (iPhone, file de 3 nouvelles licences) : seule la
+  // dernière est arrivée au panier, les deux autres marquées « saisi » sans
+  // licence. Le script décidait 1,5–2,5 s après « Suivant », puis naviguait
+  // vers l'adhérent suivant alors que le POST FFJDA (lent) était encore en
+  // vol : la navigation l'annulait. Le dernier de la file, sans navigation
+  // derrière, passait. Désormais :
+  //  • flow.pendingSubmit = { id, idx, url, step, at, kind } est noté AVANT
+  //    l'envoi automatique, ou dès l'événement `submit` d'un clic manuel ;
+  //  • tant qu'il est posé, le script ne navigue pas : seule la page
+  //    SUIVANTE décide (resolvePendingSubmit) — panier ou autre page = succès,
+  //    même formulaire réaffiché = refus FFJDA ;
+  //  • rien après SUBMIT_TIMEOUT_MS : pause (flow.pause), rien n'est marqué ni
+  //    passé sans que l'utilisateur le dise (« C'est dans le panier »,
+  //    « Réessayer », « Passer »).
+  const SUBMIT_TIMEOUT_MS = 60000;
+  const PANIER_RE = /d[ée]j[àa]\s+dans\s+le\s+panier/i;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function isFormStep(step) { return step === 'etape2' || step === 'renew_form'; }
+
+  // Réglage de test (clé de stockage submit_timeout_ms) ; 60 s sinon.
+  async function submitTimeoutMs() {
+    const v = Number(await storeGet('submit_timeout_ms', 0));
+    return v > 0 ? v : SUBMIT_TIMEOUT_MS;
   }
 
-  async function completeManualAddress(flow, adherent, reason) {
-    delete flow.manual;
-    await storeSet('flow', flow);
-    await setStatus(`${adherent.nom} ✅ (adresse corrigée)`, 'success');
-    apiMarkSaisie(adherent);
-    await finishAdherent(flow, adherent, true, reason, 2000);
-  }
-
-  // Au chargement d'une page pendant une correction d'adresse manuelle.
-  async function resumeManualAddress(flow, adherent) {
-    const idx = flow.current, total = flow.queue.length;
-    if (location.href === flow.manual.url) {
-      // Page rechargée sur le formulaire (erreur, retour…) : on ne remplit
-      // rien, on réaffiche juste l'adresse HelloAsso.
-      await new Promise(r => setTimeout(r, 1200));
-      await applyStep('showAddress', adherent);
-      await waitManualAddress(flow, adherent, location.href, idx, total);
+  // Remplit le formulaire (étape 2 ou renouvellement) puis l'envoie. Adresse
+  // automatique en nouvelle licence seulement (voir applyStep 'etape2').
+  async function runForm(flow, adherent, idx, total, step) {
+    const label = step === 'renew_form' ? 'formulaire renouvellement' : 'étape 2';
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ${label}...`, 'info');
+    await sleep(1200);
+    let r;
+    try {
+      r = await applyStep('etape2', adherent, { autoAddress: step === 'etape2' });
+    } catch (e) {
+      await enterPause(flow, adherent, 'nosubmit', `Erreur ${label} : ${e.message}`);
       return;
     }
-    const err = await applyStep('checkError', adherent);
-    if (err && err.hasError && !/d[ée]j[àa]\s+dans\s+le\s+panier/i.test(err.errorText)) {
-      delete flow.manual;
+    if (r && r.needsAddress) {
+      await enterPause(flow, adherent, 'address', r.addressReason || '');
+      return;
+    }
+    if (!r || !r.ready) {
+      await enterPause(flow, adherent, 'nosubmit', `${label} : formulaire non rempli`);
+      return;
+    }
+    const a = r.autoAddress;
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ${label} remplie`
+      + (a && a.ok ? ` (adresse : ${a.street}, ${a.cp})` : '') + ' → Suivant...', 'info');
+    await autoSubmit(flow, adherent, idx, total, step);
+  }
+
+  let autoSubmitting = false;
+
+  async function autoSubmit(flow, adherent, idx, total, step) {
+    const ps = { id: Date.now(), idx, url: location.href, step, at: Date.now(), kind: 'auto' };
+    flow.pendingSubmit = ps;
+    delete flow.pause;
+    await storeSet('flow', flow);                    // AVANT le clic
+    let r;
+    autoSubmitting = true;
+    try { r = await applyStep('submitForm', adherent); }
+    catch (e) { r = { submitted: false, reason: 'Erreur : ' + e.message }; }
+    finally { autoSubmitting = false; }
+    if (!r || !r.submitted) {
+      // Rien n'est parti (validation du navigateur, bouton désactivé par
+      // FFJDA, message sous l'adresse) : on le dit, on attend l'utilisateur.
+      delete flow.pendingSubmit;
       await storeSet('flow', flow);
-      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-      await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
+      let fe = null;
+      try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+      const why = ((r && r.reason) || 'Formulaire non envoyé') + (fe && fe.text ? ` — FFJDA : ${fe.text}` : '');
+      await enterPause(flow, adherent, 'nosubmit', why);
       return;
     }
-    await completeManualAddress(flow, adherent, 'Adresse corrigée à la main');
+    await waitSubmitNavigation(adherent, ps, total);
   }
 
-  // Boutons du panneau pendant la pause « adresse » : reprise manuelle si
-  // FFJDA valide sans changer de page, ou abandon de cet adhérent.
-  function renderManualControls(flow) {
-    const content = document.getElementById('jcc-ffjda-content');
-    if (!content || content.querySelector('#jcc-manual-done')) return;
-    const wrap = document.createElement('div');
-    wrap.innerHTML = `
-      <button class="jcc-btn" id="jcc-manual-done">✅ Adresse validée, adhérent suivant</button>
-      <button class="jcc-btn secondary" id="jcc-manual-skip">⏭ Passer cet adhérent</button>`;
-    content.prepend(wrap);
+  // Envoi parti : on attend que FFJDA réponde. Si la page change, ce
+  // contexte disparaît et la page suivante conclut (resolvePendingSubmit).
+  async function waitSubmitNavigation(adherent, ps, total) {
+    const timeout = await submitTimeoutMs();
+    await setStatus(`[${ps.idx + 1}/${total}] ${adherent.nom} — « Suivant » envoyé à FFJDA, attente de la page suivante`
+      + ` (jusqu'à ${Math.round(timeout / 1000)} s)… Ne quittez pas la page.`, 'info');
+    const end = Date.now() + timeout;
+    const mine = (f) => f && f.pendingSubmit && f.pendingSubmit.id === ps.id;
+    while (Date.now() < end) {
+      await sleep(500);
+      if (!mine(await storeGet('flow', null))) return;   // annulé, remplacé, décidé
+    }
+    // Toujours sur la même page : ni « succès probable » ni « saisi ».
+    // pendingSubmit reste posé : si FFJDA finit par répondre, la page
+    // suivante conclura d'elle-même.
+    const cur = await storeGet('flow', null);
+    if (!mine(cur)) return;
+    await enterPause(cur, adherent, 'timeout', `Pas de réponse de FFJDA ${Math.round(timeout / 1000)} s après « Suivant ». `
+      + 'Vérifiez le panier FFJDA (la page peut encore changer d\'elle-même).');
+  }
+
+  // Au chargement d'une page alors qu'un envoi était en vol pour l'adhérent courant.
+  async function resolvePendingSubmit(flow, adherent) {
+    const ps = flow.pendingSubmit;
+    const idx = flow.current, total = flow.queue.length;
+    const step = detectStep(location.href);
+    await sleep(800);
+    let err = null;
+    try { err = await applyStep('checkError', adherent); } catch (e) {}
+    const settle = async () => { delete flow.pendingSubmit; delete flow.pause; await storeSet('flow', flow); };
+    if (err && err.hasError && PANIER_RE.test(err.errorText)) {
+      await settle();
+      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà dans le panier FFJDA, rien à faire.`, 'success');
+      apiMarkSaisie(adherent);
+      await finishAdherent(flow, adherent, true, 'Déjà dans le panier FFJDA (aucune action nécessaire)', 2500);
+      return;
+    }
+    if (isFormStep(step) && (step === ps.step || location.href === ps.url)) {
+      // Formulaire réaffiché : FFJDA a refusé. Rien de créé, on attend l'utilisateur.
+      delete flow.pendingSubmit;
+      await storeSet('flow', flow);
+      let fe = null;
+      try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+      const why = (err && err.hasError && err.errorText) || (fe && fe.text) || 'aucun message affiché';
+      await enterPause(flow, adherent, 'error', `FFJDA a réaffiché le formulaire après « Suivant » : ${why}`);
+      return;
+    }
+    if (err && err.hasError) {
+      await settle();
+      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
+      await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText} — NON marqué saisi`, 3000);
+      return;
+    }
+    // Page suivante hors formulaire (panier en principe) : la licence est partie.
+    await settle();
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅ dans le panier FFJDA`, 'success');
+    apiMarkSaisie(adherent);
+    await finishAdherent(flow, adherent, true, step === 'panier' ? null : `Page suivante FFJDA : ${location.pathname}`, 2000);
+  }
+
+  // ── Pause : adresse à saisir, formulaire refusé ou non envoyé, pas de réponse ──
+
+  async function enterPause(flow, adherent, kind, reason) {
+    const step = detectStep(location.href);
+    const prev = flow.pause || {};
+    const ps = flow.pendingSubmit || {};
+    flow.pause = {
+      id: Date.now(), idx: flow.current, kind, reason: reason || '',
+      formUrl: isFormStep(step) ? location.href : (prev.formUrl || ps.url || null),
+      step: isFormStep(step) ? step : (prev.step || ps.step || null),
+    };
+    await storeSet('flow', flow);
+    await showPause(flow, adherent);
+  }
+
+  async function showPause(flow, adherent) {
+    const p = flow.pause;
+    const idx = flow.current, total = flow.queue.length;
+    const onForm = isFormStep(detectStep(location.href));
+    const head = {
+      address: '✋ adresse à saisir sur la page (adresse HelloAsso dans l\'encadré)',
+      error: '⚠️ formulaire refusé par FFJDA',
+      nosubmit: '✋ formulaire non envoyé',
+      timeout: '⏳ pas de réponse de FFJDA',
+    }[p.kind] || '✋ en attente';
+    await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ${adherent.prenom} — ${head}.`
+      + (p.reason ? `\n${p.reason}` : '')
+      + (onForm ? '\nCorrigez puis cliquez SUIVANT : la file reprendra à la page suivante.' : ''),
+    p.kind === 'address' ? 'info' : 'error');
+    renderPauseControls();
+    if (onForm) armSubmitListener();
+  }
+
+  // Au chargement d'une page pendant une pause (aucun envoi en vol connu).
+  async function resumePause(flow, adherent) {
+    const step = detectStep(location.href);
+    if (step === 'panier') {
+      // Le panier lui-même : envoi parti sans qu'on l'ait vu (ou validé à la main).
+      delete flow.pause;
+      await storeSet('flow', flow);
+      await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} ✅ dans le panier FFJDA`, 'success');
+      apiMarkSaisie(adherent);
+      await finishAdherent(flow, adherent, true, 'Panier FFJDA atteint après validation à la main', 2000);
+      return;
+    }
+    if (isFormStep(step) && flow.pause.kind === 'address') {
+      // Formulaire rechargé : on ne remplit rien, on réaffiche l'adresse HelloAsso.
+      await sleep(1200);
+      try {
+        await applyStep('showAddress', adherent, { reason: flow.pause.reason, mode: step === 'etape2' ? 'nouvelle' : 'renouvellement' });
+      } catch (e) {}
+    }
+    await showPause(flow, adherent);
+  }
+
+  // « Suivant » cliqué à la main pendant la pause : noté AUSSITÔT (l'envoi
+  // peut aboutir avant que ce contexte ait fini quoi que ce soit d'autre).
+  let submitListenerArmed = false;
+  function armSubmitListener() {
+    if (submitListenerArmed) return;
+    submitListenerArmed = true;
+    document.addEventListener('submit', (ev) => {
+      if (autoSubmitting) return;
+      const t = ev.target;
+      if (t && t.closest && t.closest('#jcc-ffjda-panel, #jcc-address-box')) return;
+      // SYNCHRONE : la saisie manuelle de l'adresse remet la souscription IAC
+      // sur « Non » (recalcul FFJDA) ; les données envoyées ne sont lues
+      // qu'après les handlers de `submit`.
+      if (document.querySelector('input[name="souscription"]')) applyStep('ensureIAC', {});
+      onManualSubmit(ev);
+    }, true);
+  }
+  async function onManualSubmit(ev) {
+    const flow = await storeGet('flow', null);
+    if (!flow || !flow.pause || flow.pause.idx !== flow.current) return;
     const adherent = flow.queue[flow.current];
-    wrap.querySelector('#jcc-manual-done').addEventListener('click', async () => {
+    const ps = { id: Date.now(), idx: flow.current, url: location.href, step: detectStep(location.href),
+      at: Date.now(), kind: 'manuel' };
+    flow.pendingSubmit = ps;
+    await storeSet('flow', flow);
+    if (ev.defaultPrevented) {
+      // Annulé par la page FFJDA : rien n'est parti.
       const cur = await storeGet('flow', null);
-      if (cur && cur.manual) { wrap.remove(); await completeManualAddress(cur, adherent, 'Adresse corrigée à la main (validée par l\'utilisateur)'); }
-    });
-    wrap.querySelector('#jcc-manual-skip').addEventListener('click', async () => {
+      if (cur && cur.pendingSubmit && cur.pendingSubmit.id === ps.id) {
+        delete cur.pendingSubmit;
+        await storeSet('flow', cur);
+      }
+      let fe = null;
+      try { fe = await applyStep('formErrors', adherent); } catch (e) {}
+      await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} — « Suivant » bloqué par FFJDA`
+        + (fe && fe.text ? ` : ${fe.text}` : '') + '. Corrigez puis cliquez à nouveau SUIVANT.', 'error');
+      return;
+    }
+    await waitSubmitNavigation(adherent, ps, flow.queue.length);
+  }
+
+  // Boutons de la pause, dans le panneau.
+  function renderPauseControls() {
+    const content = document.getElementById('jcc-ffjda-content');
+    if (!content) return;
+    const old = content.querySelector('#jcc-pause-ctl');
+    if (old) old.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'jcc-pause-ctl';
+    wrap.innerHTML = `
+      <button class="jcc-btn" id="jcc-pause-done">✓ C'est dans le panier, continuer</button>
+      <div class="jcc-btn-row">
+        <button class="jcc-btn secondary" id="jcc-pause-retry">↻ Réessayer</button>
+        <button class="jcc-btn secondary" id="jcc-pause-skip">⏭ Passer</button>
+      </div>`;
+    content.prepend(wrap);
+    const body = document.getElementById('jcc-ffjda-body');
+    if (body) body.style.display = '';
+    // Relit la file : l'état a pu changer depuis l'affichage (annulation…).
+    const current = async () => {
       const cur = await storeGet('flow', null);
-      if (!cur || !cur.manual) return;
+      if (!cur || !cur.pause || cur.pause.idx !== cur.current) return null;
       wrap.remove();
-      delete cur.manual;
+      const pause = cur.pause;
+      delete cur.pause;
+      delete cur.pendingSubmit;
       await storeSet('flow', cur);
-      await finishAdherent(cur, adherent, false, 'Adresse à corriger — passé, à saisir à la main', 500);
+      return { cur, pause, adherent: cur.queue[cur.current] };
+    };
+    wrap.querySelector('#jcc-pause-done').addEventListener('click', async () => {
+      const c = await current();
+      if (!c) return;
+      await setStatus(`${c.adherent.nom} ✅ (confirmé dans le panier)`, 'success');
+      apiMarkSaisie(c.adherent);
+      await finishAdherent(c.cur, c.adherent, true, 'Confirmé à la main : dans le panier FFJDA', 1000);
+    });
+    wrap.querySelector('#jcc-pause-retry').addEventListener('click', async () => {
+      const c = await current();
+      if (!c) return;
+      const step = detectStep(location.href);
+      if (isFormStep(step)) {
+        await runForm(c.cur, c.adherent, c.cur.current, c.cur.queue.length, step);
+      } else {
+        await setStatus(`${c.adherent.nom} — retour au formulaire...`, 'info');
+        location.href = c.pause.formUrl || RENEW_SEARCH_URL;
+      }
+    });
+    wrap.querySelector('#jcc-pause-skip').addEventListener('click', async () => {
+      const c = await current();
+      if (!c) return;
+      await setStatus(`${c.adherent.nom} — passé (NON marqué saisi).`, 'error');
+      await finishAdherent(c.cur, c.adherent, false, 'Passé à la main — NON marqué saisi, à vérifier sur FFJDA', 500);
     });
   }
 
   async function handleStep(flowArg) {
     const flow = flowArg || await storeGet('flow', null);
     if (!flow) return;
+    const cur = flow.queue[flow.current];
     if (flow.manual) {
-      const a = flow.queue[flow.current];
-      if (a) { await resumeManualAddress(flow, a); return; }
+      // File d'une version ≤ 1.9.5 en pause « adresse » : même attente.
+      flow.pause = { id: Date.now(), idx: flow.current, kind: 'address', reason: '',
+        formUrl: flow.manual.url, step: detectStep(flow.manual.url) };
+      delete flow.manual;
+      await storeSet('flow', flow);
+    }
+    // Un envoi était en vol : c'est CETTE page qui dit s'il a abouti (avant
+    // tout le reste, y compris quand la page n'est pas reconnue).
+    if (flow.pendingSubmit) {
+      if (cur && flow.pendingSubmit.idx === flow.current) { await resolvePendingSubmit(flow, cur); return; }
+      delete flow.pendingSubmit;
+      await storeSet('flow', flow);
+    }
+    if (flow.pause) {
+      if (cur && flow.pause.idx === flow.current) { await resumePause(flow, cur); return; }
+      delete flow.pause;
+      await storeSet('flow', flow);
     }
     if (flow.manualEtape1) {
       // En attente de l'étape 1 finie à la main (voir waitManualEtape1).
@@ -1644,61 +2179,10 @@
     }
 
     if (step === 'renew_form') {
-      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — formulaire renouvellement...`, 'info');
-      await new Promise(r => setTimeout(r, 1200));
-      try {
-        const r = await applyStep('etape2', adherent);
-        if (!r) {
-          await setStatus(`Renouvellement [${idx + 1}] : pas de réponse.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
-          return;
-        }
-        if (r.needsAddress) {
-          await waitManualAddress(flow, adherent, startUrl, idx, total);
-          return;
-        }
-        if (r.success) {
-          await new Promise(res => setTimeout(res, 1500));
-          const err = await applyStep('checkError', adherent);
-          if (err && err.hasError) {
-            // "Licence déjà dans le panier du club" : l'objectif (licence en
-            // file d'attente pour ce club) est déjà atteint — souvent parce
-            // qu'une tentative précédente a réussi mais a été signalée à
-            // tort en échec (voir plus bas). Ce n'est pas un échec.
-            if (/d[ée]j[àa]\s+dans\s+le\s+panier/i.test(err.errorText)) {
-              await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà dans le panier FFJDA, rien à faire.`, 'success');
-              apiMarkSaisie(adherent);
-              await finishAdherent(flow, adherent, true, 'Déjà dans le panier FFJDA (aucune action nécessaire)', 2500);
-              return;
-            }
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
-            return;
-          }
-          if (location.href === startUrl) {
-            // Observé en prod (lot du 19/09/2026) : FFJDA valide parfois SANS
-            // naviguer ni afficher d'erreur — 4 cas de cette forme se sont
-            // tous avérés être de VRAIS succès une fois vérifiés dans le
-            // panier. On ne peut donc plus le traiter comme un échec par
-            // défaut : compté en succès, avec un avertissement à vérifier
-            // plutôt qu'un échec alarmant qui pousserait à ressaisir (et
-            // créer un doublon).
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — page inchangée, succès probable (à vérifier dans le panier).`, 'success');
-            apiMarkSaisie(adherent);
-            await finishAdherent(flow, adherent, true, 'Page inchangée après soumission — succès probable, à vérifier dans le panier FFJDA', 2500);
-            return;
-          }
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
-          apiMarkSaisie(adherent);
-          await finishAdherent(flow, adherent, true, null, 2500);
-        } else {
-          await setStatus(`Renouvellement [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
-          await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
-        }
-      } catch (e) {
-        await setStatus('Erreur formulaire renouvellement : ' + e.message, 'error');
-        await finishAdherent(flow, adherent, false, 'Erreur formulaire renouvellement : ' + e.message);
-      }
+      // Même envoi que l'étape 2 (voir runForm / autoSubmit) : l'ancien « page
+      // inchangée = succès probable » au bout de 1,5 s est supprimé — c'était
+      // précisément le POST encore en vol que la navigation suivante annulait.
+      await runForm(flow, adherent, idx, total, step);
       return;
     }
 
@@ -1732,64 +2216,7 @@
 
     if (step === 'etape2') {
       if (!await creationAllowed(flow, adherent, idx, total, 'Étape 2')) return;
-      await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — étape 2...`, 'info');
-      await new Promise(r => setTimeout(r, 1200));
-      try {
-        const r = await applyStep('etape2', adherent);
-        if (!r) {
-          await setStatus(`Étape 2 [${idx + 1}] : pas de réponse.`, 'error');
-          await finishAdherent(flow, adherent, false, 'Pas de réponse du formulaire');
-          return;
-        }
-        if (r.needsAddress) {
-          await waitManualAddress(flow, adherent, startUrl, idx, total);
-          return;
-        }
-        if (r.success) {
-          await new Promise(res => setTimeout(res, 1500));
-          const err = await applyStep('checkError', adherent);
-          if (err && err.hasError) {
-            // Voir le même cas dans le bloc renouvellement plus haut.
-            if (/d[ée]j[àa]\s+dans\s+le\s+panier/i.test(err.errorText)) {
-              await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — déjà dans le panier FFJDA, rien à faire.`, 'success');
-              apiMarkSaisie(adherent);
-              await finishAdherent(flow, adherent, true, 'Déjà dans le panier FFJDA (aucune action nécessaire)', 2500);
-              return;
-            }
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — erreur FFJDA : ${err.errorText}`, 'error');
-            await finishAdherent(flow, adherent, false, `Erreur FFJDA à l'enregistrement : ${err.errorText}`, 3000);
-            return;
-          }
-          if (location.href === startUrl) {
-            // Contrairement au renouvellement (4/4 vrais succès observés pour
-            // "pas d'erreur, pas de navigation"), AUCUNE observation ne
-            // l'établit pour une nouvelle licence, et un formulaire refusé
-            // côté navigateur (champ requis, script FFJDA planté) donne
-            // exactement ce tableau. Marquer « saisi » sans preuve fait
-            // disparaître l'adhérent de la liste « à saisir » (constaté en
-            // prod le 05/10/2026 : un adhérent marqué saisi, aucune licence
-            // créée — chemin exact non établi faute de traces). Non marqué :
-            // au pire il réapparaît, et une relance repasse par la recherche
-            // FFJDA qui empêche toute création si la licence existe déjà.
-            let fe = null;
-            try { fe = await applyStep('formErrors', adherent); } catch (e) {}
-            const why = 'Page inchangée après « Suivant » — NON marqué saisi : vérifier le panier FFJDA'
-              + (fe && fe.text ? ` (FFJDA : ${fe.text})` : '');
-            await setStatus(`[${idx + 1}/${total}] ${adherent.nom} — ${why}`, 'error');
-            await finishAdherent(flow, adherent, false, why, 2500);
-            return;
-          }
-          await setStatus(`[${idx + 1}/${total}] ${adherent.nom} ✅`, 'success');
-          apiMarkSaisie(adherent);
-          await finishAdherent(flow, adherent, true, null, 2500);
-        } else {
-          await setStatus(`Étape 2 [${idx + 1}] : échec (${r.error || 'inconnu'}).`, 'error');
-          await finishAdherent(flow, adherent, false, r.error || 'Échec remplissage formulaire');
-        }
-      } catch (e) {
-        await setStatus('Erreur étape 2 : ' + e.message, 'error');
-        await finishAdherent(flow, adherent, false, 'Erreur étape 2 : ' + e.message);
-      }
+      await runForm(flow, adherent, idx, total, step);
       return;
     }
   }
