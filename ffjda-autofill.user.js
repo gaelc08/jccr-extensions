@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JCCR Saisie FFJDA (mobile / Safari)
 // @namespace    https://github.com/gaelc08/jccr-gestion
-// @version      1.10.1
+// @version      1.11.0
 // @description  Portage mobile de l'extension Chrome JCCR — pré-remplit le formulaire de licence FFJDA depuis les adhérents synchronisés HelloAsso. Panneau flottant, queue batch, fonctionne avec l'app "Userscripts" sur iOS Safari.
 // @author       Gaël CANTARERO
 // @match        https://moncompte.ffjudo.com/*
@@ -1367,7 +1367,7 @@
   // Affiché dans l'en-tête du panneau : permet de vérifier d'un coup d'œil
   // quelle version tourne réellement (l'app Userscripts peut servir une
   // copie en cache). À garder synchro avec @version en tête de fichier.
-  const SCRIPT_VERSION = '1.10.1';
+  const SCRIPT_VERSION = '1.11.0';
 
   // ================================================================
   // Stockage — GM.* (async, moderne) avec repli GM_* (sync, legacy)
@@ -1625,8 +1625,7 @@
       </div>`;
     content.prepend(wrap);
     // Panneau replié : on le rouvre, c'est là qu'est la date.
-    const body = document.getElementById('jcc-ffjda-body');
-    if (body) body.style.display = '';
+    setPanelExpanded(true);
 
     const copyBtn = wrap.querySelector('#jcc-e1-copy');
     if (copyBtn) copyBtn.addEventListener('click', async () => {
@@ -1723,6 +1722,8 @@
     await storeSet('bilan', { msg, type, ts: Date.now() });
     await setStatus(msg, type);
     await renderIdle();
+    // Fin de file : on montre le bilan une fois, l'utilisateur réduit ensuite.
+    setPanelExpanded(true);
   }
 
   async function startQueue(queue) {
@@ -1970,6 +1971,7 @@
       try { fe = await applyStep('formErrors', adherent); } catch (e) {}
       await setStatus(`[${flow.current + 1}/${flow.queue.length}] ${adherent.nom} — « Suivant » bloqué par FFJDA`
         + (fe && fe.text ? ` : ${fe.text}` : '') + '. Corrigez puis cliquez à nouveau SUIVANT.', 'error');
+      setPanelExpanded(true);
       return;
     }
     await waitSubmitNavigation(adherent, ps, flow.queue.length);
@@ -1990,8 +1992,7 @@
         <button class="jcc-btn secondary" id="jcc-pause-skip">⏭ Passer</button>
       </div>`;
     content.prepend(wrap);
-    const body = document.getElementById('jcc-ffjda-body');
-    if (body) body.style.display = '';
+    setPanelExpanded(true);
     // Relit la file : l'état a pu changer depuis l'affichage (annulation…).
     const current = async () => {
       const cur = await storeGet('flow', null);
@@ -2308,6 +2309,13 @@
         font-size: 13px; width: min(340px, calc(100vw - 32px)); max-height: 80vh;
         overflow: hidden; display: flex; flex-direction: column;
       }
+      /* Réduit (par défaut) : simple pastille en bas à droite, la page FFJDA reste utilisable. */
+      #jcc-ffjda-panel.jcc-collapsed { width: auto; max-width: calc(100vw - 32px); border-radius: 22px; }
+      #jcc-ffjda-panel.jcc-collapsed #jcc-ffjda-body { display: none; }
+      #jcc-ffjda-panel.jcc-collapsed #jcc-ffjda-header { border-radius: 22px; padding: 10px 16px; gap: 10px; }
+      #jcc-ffjda-header .jcc-head-right { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+      #jcc-ffjda-header .jcc-head-progress:empty { display: none; }
+      #jcc-ffjda-header .jcc-head-progress { background: #1a6fa8; color: #fff; border-radius: 9px; padding: 1px 7px; font-weight: 600; }
       #jcc-ffjda-header {
         background: #0d3b5e; padding: 10px 14px; display: flex;
         align-items: center; justify-content: space-between; cursor: pointer; user-select: none; flex: none;
@@ -2364,9 +2372,12 @@
     const panel = document.createElement('div');
     panel.id = 'jcc-ffjda-panel';
     panel.innerHTML = `
-      <div id="jcc-ffjda-header">
+      <div id="jcc-ffjda-header" role="button" aria-expanded="false" title="Afficher / réduire le panneau">
         <span class="title">🥋 JCCR → FFJDA</span>
-        <span style="font-size:11px;opacity:.7">v${SCRIPT_VERSION} ▾</span>
+        <span class="jcc-head-right">
+          <span class="jcc-head-progress"></span>
+          <span style="opacity:.7">v${SCRIPT_VERSION} <span class="jcc-head-chevron">▸</span></span>
+        </span>
       </div>
       <div id="jcc-ffjda-body">
         <div id="jcc-ffjda-bilan" style="display:none"></div>
@@ -2375,12 +2386,24 @@
         <div id="jcc-ffjda-content"></div>
       </div>
     `;
+    // Réduit par défaut à chaque page : il ne doit pas masquer le formulaire
+    // FFJDA. Il se rouvre seul quand une action est attendue (setPanelExpanded).
+    panel.classList.add('jcc-collapsed');
     document.body.appendChild(panel);
     panel.querySelector('#jcc-ffjda-header').addEventListener('click', () => {
-      const b = panel.querySelector('#jcc-ffjda-body');
-      b.style.display = b.style.display === 'none' ? '' : 'none';
+      setPanelExpanded(panel.classList.contains('jcc-collapsed'));
     });
     return panel;
+  }
+
+  function setPanelExpanded(expanded) {
+    const panel = document.getElementById('jcc-ffjda-panel');
+    if (!panel) return;
+    panel.classList.toggle('jcc-collapsed', !expanded);
+    const header = panel.querySelector('#jcc-ffjda-header');
+    if (header) header.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    const chev = panel.querySelector('.jcc-head-chevron');
+    if (chev) chev.textContent = expanded ? '▾' : '▸';
   }
 
   function renderStatus(msg, type) {
@@ -2433,9 +2456,14 @@
     if (!fill) return;
     const pct = total > 0 ? Math.round((current / total) * 100) : 0;
     fill.style.width = pct + '%';
+    // Visible aussi panneau réduit : avancement de la file en cours.
+    const head = document.querySelector('#jcc-ffjda-header .jcc-head-progress');
+    if (head) head.textContent = total > 0 ? `${Math.min(current + 1, total)}/${total}` : '';
   }
 
   function renderTokenForm(content) {
+    // Premier lancement : rien ne marche sans token, on ouvre le panneau.
+    setPanelExpanded(true);
     content.innerHTML = `
       <div class="jcc-f-row">
         <input type="password" id="jcc-token-input" placeholder="Token API sync.judo-cattenom.fr">
@@ -2640,6 +2668,7 @@
     if (!res.ok) {
       if (res.missingToken) { renderTokenForm(content); return; }
       await setStatus(`❌ Erreur chargement : ${res.data.detail || res.status}`, 'error');
+      setPanelExpanded(true);
       return;
     }
     adherents = res.data.adherents || [];
