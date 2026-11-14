@@ -17,11 +17,8 @@ Ce dépôt héberge uniquement les artefacts prêts à l'emploi qui doivent êtr
 
 ## Mise à jour depuis `jccr-gestion`
 
-Ne jamais modifier `ffjda-autofill.user.js` directement dans ce dépôt :
+Ne jamais modifier les userscripts directement dans ce dépôt : ils sont écrasés à la publication suivante.
 
-```bash
-# Dans jccr-gestion :
-npm test
-npm run build:userscript
-# Puis copier dist/userscripts/ffjda-autofill.user.js vers jccr-extensions
-```
+La mise à jour est automatique. À chaque push sur `main` de `jccr-gestion` qui touche aux sources des userscripts, le workflow `publish-userscripts.yml` de ce dépôt lance les tests, assemble les fichiers et les pousse ici (commits `Sync: … (jccr-gestion <sha>)` signés `github-actions[bot]`). Il refuse de publier un fichier modifié dont la `@version` n'a pas augmenté.
+
+L'accès en écriture passe par une clé de déploiement de ce dépôt (**Settings → Deploy keys**), dont la partie privée est le secret `EXTENSIONS_DEPLOY_KEY` de `jccr-gestion`.
